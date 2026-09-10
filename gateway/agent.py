@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -40,12 +41,28 @@ class Agent:
         turn_id = session.next_turn()
         session_id = session.session_id
         self._debug.log_turn_start(session_id, turn_id, user_message)
+        print(f"[AGENT] Turn {turn_id} started for session {session_id[:8]}...")
+        print(f"[AGENT] User message: {user_message[:100]}")
+
+        # Check if user is providing a token for sign-in
+        token_match = re.search(r"(?:token|api[._-]?key|access[._-]?key)\s*[:=]\s*(\S+)", user_message, re.IGNORECASE)
+        if token_match:
+            new_token = token_match.group(1)
+            session.user_token = new_token
+            print(f"[AGENT] Token received, session authenticated")
+            yield {
+                "type": "text",
+                "content": "You're now signed in! I've saved your token for this session. You can now perform actions like adding to cart or checking out.",
+            }
+            return
 
         intent, confidence = await self._classify_intent(user_message, session)
         self._debug.log_intent(session_id, turn_id, intent, confidence)
+        print(f"[AGENT] Intent classified: {intent} (confidence: {confidence:.2f})")
 
         if intent == "action" and not session.user_token:
             self._debug.log("auth.required", {"reason": "unauthenticated_action"}, session_id, turn_id)
+            print(f"[AGENT] Action requires authentication, prompting sign-in")
             yield {
                 "type": "ui_directive",
                 "directive": UIDirective(
@@ -85,13 +102,17 @@ class Agent:
         session_id = session.session_id
 
         if event_type == "delta":
-            yield {"type": "text", "content": event.get("content", "")}
+            content = event.get("content", "")
+            if content:
+                self._debug.log("model.text_delta", {"content": content[:200]}, session_id, turn_id)
+                yield {"type": "text", "content": content}
 
         elif event_type == "tool_calls":
             for tc in event.get("tool_calls", []):
                 tool_name = tc.get("name", "")
                 tool_args = tc.get("arguments", {})
                 self._debug.log_tool_selected(session_id, turn_id, tool_name, tool_args)
+                print(f"[AGENT] Tool call: {tool_name} with args {tool_args}")
 
                 from mcp_server.tools_catalog import is_mutating_financial
                 if is_mutating_financial(tool_name) and confirmed_token:
@@ -115,11 +136,14 @@ class Agent:
                     }
                 elif result.get("status") == "error":
                     self._debug.log_error(session_id, turn_id, result.get("error_kind", "tool_error"), result.get("message", "Unknown"))
+                    print(f"[AGENT] Tool error: {tool_name} - {result.get('message', 'Unknown error')}")
                     yield {"type": "error", "error": result.get("message", "An error occurred.")}
                 else:
                     self._debug.log_tool_result(session_id, turn_id, tool_name, _summarize_result(result))
+                    print(f"[AGENT] Tool success: {tool_name} - result type: {type(result.get('data')).__name__}")
                     text_summary = _result_to_text(tool_name, result)
                     if text_summary:
+                        print(f"[AGENT] Text summary: {text_summary}")
                         yield {"type": "text", "content": text_summary}
                     directive = self._result_to_directive(tool_name, result, session_id)
                     if directive:
@@ -140,37 +164,69 @@ class Agent:
     async def _execute_tool(
         self, tool_name: str, args: dict[str, Any], session: Session, turn_id: int,
     ) -> dict[str, Any]:
-        """Execute a tool call."""
+        """Execute a tool call against the backend API."""
         from mcp_server.tools_catalog import BY_NAME, is_mutating_financial
+
+        session_id = session.session_id
         meta = BY_NAME.get(tool_name)
         if not meta:
+            self._debug.log_error(session_id, turn_id, "unknown_tool", f"Unknown tool: {tool_name}")
             return {"status": "error", "message": f"Unknown tool: {tool_name}"}
 
-        args["token"] = session.user_token
+        self._debug.log("tool.execute_start", {"tool_name": tool_name, "args": _summarize_args(args)}, session_id, turn_id)
 
+        # Check confirmation for mutating financial tools
         if is_mutating_financial(tool_name):
             provided_token = args.get("user_confirmed_token")
             if not provided_token:
                 return {"status": "confirmation_required", "message": f"This action ({tool_name}) requires your confirmation."}
             try:
-                await self._gate.check_confirmation(session.session_id, turn_id, tool_name, provided_token)
+                await self._gate.check_confirmation(session_id, turn_id, tool_name, provided_token)
             except Exception as e:
                 return {"status": "confirmation_required", "message": str(e), "error_kind": "confirmation_required"}
 
-        return {"status": "success", "tool_name": tool_name, "data": args}
+        # Call the backend API
+        token = session.user_token
+        try:
+            self._debug.log_backend_call(session_id, turn_id, meta.method, meta.path, None, 0)
+            # Build full URL for logging
+            full_url = f"{self._client._base}{self._client._prefix}{meta.path}"
+            print(f"[AGENT] Backend endpoint: {meta.method} {full_url}")
+            # Extract path params (keys like {product_id} in the path)
+            path_keys = re.findall(r"\{(\w+)\}", meta.path)
+            path_params = {k: args[k] for k in path_keys if k in args} if path_keys else None
+
+            result = await self._client.call(
+                meta.method,
+                meta.path,
+                token=token,
+                params=args if meta.method == "GET" else None,
+                json_body=args if meta.method in ("POST", "PUT", "PATCH") else None,
+                path_params=path_params,
+            )
+            self._debug.log("tool.execute_success", {"tool_name": tool_name, "result_type": type(result).__name__}, session_id, turn_id)
+            print(f"[AGENT] Backend response: {type(result).__name__} - {str(result)[:200]}")
+            return {"status": "success", "tool_name": tool_name, "data": result}
+        except Exception as e:
+            self._debug.log_error(session_id, turn_id, "tool_execution_error", f"{tool_name}: {e}")
+            print(f"[AGENT] Backend error: {e}")
+            return {"status": "error", "message": f"Tool {tool_name} failed: {e}", "error_kind": "tool_execution_error"}
 
     _INTENT_CLASSIFICATION_PROMPT = (
         "You are an intent classifier for a marketplace assistant. "
-        "Classify the user's message into exactly one of these intents:\n"
-        "- 'info': The user is asking a question, browsing, searching, reading reviews, "
-        "checking order status, or seeking information. No state will be modified.\n"
-        "- 'action': The user wants to perform an operation that modifies state — "
-        "buying, checking out, paying, placing an order, purchasing, adding to cart, "
-        "requesting a refund or payout, creating/updating/deleting a resource, "
-        "approving KYC, shipping, or fulfilling.\n\n"
-        "Be precise: if the user is merely asking *about* an action (e.g. 'how do I refund?') "
-        "without requesting it, classify as 'info'. Only classify as 'action' when the user "
-        "is requesting the operation itself.\n\n"
+        "Classify the user\'s message into exactly one of these intents:\n"
+        "- \'info\': The user is browsing, searching, asking questions, reading reviews, "
+        "checking order status, expressing general interest in products, or seeking information. "
+        "No state will be modified. This includes phrases like \'I am looking to buy X\', "
+        "\'show me X\', \'find me X\', \'I want to see X\', \'do you have X\', \'how much is X\', etc.\n"
+        "- \'action\': The user explicitly requests an operation that modifies state \u2014 "
+        "adding to cart (\'add this to my cart\'), checking out (\'checkout now\'), "
+        "paying (\'pay for this\'), placing an order (\'place the order\'), "
+        "requesting a refund (\'refund this order\'), requesting a payout, "
+        "creating/updating/deleting a resource, approving KYC, shipping, or fulfilling.\n\n"
+        "Be precise: browsing and searching are ALWAYS \'info\'. "
+        "Only classify as \'action\' when the user explicitly requests a state-changing operation. "
+        "If the user is just expressing interest or looking around, classify as \'info\'.\n\n"
         "Respond with JSON only: {\"intent\": \"info\"|\"action\", \"confidence\": 0.0-1.0, \"reasoning\": \"brief explanation\"}"
     )
 
