@@ -1,0 +1,402 @@
+"""Tool catalog — metadata for every MCP tool.
+
+Maps each tool name to its backend endpoint, risk tier, whether confirmation
+is required, and which roles may see it.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import Enum
+
+
+class RiskTier(str, Enum):
+    READ_ONLY = "read_only"
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+
+
+ROLES = frozenset({"buyer", "merchant_owner", "merchant_staff", "platform_admin"})
+
+
+@dataclass(frozen=True)
+class ToolMeta:
+    """Static metadata for one tool."""
+    name: str
+    method: str
+    path: str
+    risk_tier: RiskTier
+    requires_confirmation: bool
+    visible_to: frozenset[str]
+    description: str
+
+
+# ── Read-only tools ─────────────────────────────────────────────────────
+SEARCH_PRODUCTS = ToolMeta(
+    name="search_products",
+    method="GET",
+    path="/catalog/products",
+    risk_tier=RiskTier.READ_ONLY,
+    requires_confirmation=False,
+    visible_to=ROLES | frozenset({"anonymous"}),
+    description="Search the product catalog. Read-only, safe, no confirmation needed.",
+)
+
+GET_PRODUCT_DETAIL = ToolMeta(
+    name="get_product_detail",
+    method="GET",
+    path="/catalog/products/{product_id}",
+    risk_tier=RiskTier.READ_ONLY,
+    requires_confirmation=False,
+    visible_to=ROLES | frozenset({"anonymous"}),
+    description="Get full product detail including variants. Read-only.",
+)
+
+GET_CATEGORIES = ToolMeta(
+    name="get_categories",
+    method="GET",
+    path="/catalog/categories",
+    risk_tier=RiskTier.READ_ONLY,
+    requires_confirmation=False,
+    visible_to=ROLES | frozenset({"anonymous"}),
+    description="List product categories. Read-only.",
+)
+
+# ── RAG / knowledge tools ─────────────────────────────────────────────
+SEMANTIC_SEARCH = ToolMeta(
+    name="semantic_search",
+    method="VECTOR",
+    path="",
+    risk_tier=RiskTier.READ_ONLY,
+    requires_confirmation=False,
+    visible_to=ROLES | frozenset({"anonymous"}),
+    description="Semantic search over marketplace knowledge (products, policies, FAQs). Read-only.",
+)
+
+GET_USER_PROFILE = ToolMeta(
+    name="get_user_profile",
+    method="GET",
+    path="/auth/me",
+    risk_tier=RiskTier.READ_ONLY,
+    requires_confirmation=False,
+    visible_to=ROLES,
+    description="Get the current authenticated user's profile. Read-only.",
+)
+# ── Cart tools (session-scoped) ─────────────────────────────────────────
+ADD_TO_CART = ToolMeta(
+    name="add_to_cart",
+    method="SESSION",
+    path="",
+    risk_tier=RiskTier.LOW,
+    requires_confirmation=False,
+    visible_to=ROLES | frozenset({"anonymous"}),
+    description="Add a product variant to the session cart. Low risk, no money moved.",
+)
+
+VIEW_CART = ToolMeta(
+    name="view_cart",
+    method="SESSION",
+    path="",
+    risk_tier=RiskTier.READ_ONLY,
+    requires_confirmation=False,
+    visible_to=ROLES | frozenset({"anonymous"}),
+    description="View current session cart contents. Read-only.",
+)
+
+REMOVE_FROM_CART = ToolMeta(
+    name="remove_from_cart",
+    method="SESSION",
+    path="",
+    risk_tier=RiskTier.LOW,
+    requires_confirmation=False,
+    visible_to=ROLES | frozenset({"anonymous"}),
+    description="Remove an item from the session cart.",
+)
+
+CLEAR_CART = ToolMeta(
+    name="clear_cart",
+    method="SESSION",
+    path="",
+    risk_tier=RiskTier.LOW,
+    requires_confirmation=False,
+    visible_to=ROLES | frozenset({"anonymous"}),
+    description="Clear all items from the session cart.",
+)
+
+# ── Order tools ─────────────────────────────────────────────────────────
+INITIATE_CHECKOUT = ToolMeta(
+    name="initiate_checkout",
+    method="POST",
+    path="/orders/checkout",
+    risk_tier=RiskTier.HIGH,
+    requires_confirmation=True,
+    visible_to=frozenset({"buyer", "platform_admin"}),
+    description="Initiate checkout. HIGH risk — financial, mutating. Requires user confirmation.",
+)
+
+GET_ORDER_STATUS = ToolMeta(
+    name="get_order_status",
+    method="GET",
+    path="/orders/{order_id}",
+    risk_tier=RiskTier.READ_ONLY,
+    requires_confirmation=False,
+    visible_to=ROLES,
+    description="Get the status of an order. Read-only.",
+)
+
+# ── Payment tools ───────────────────────────────────────────────────────
+PROCESS_PAYMENT = ToolMeta(
+    name="process_payment",
+    method="POST",
+    path="/payments/process",
+    risk_tier=RiskTier.HIGH,
+    requires_confirmation=True,
+    visible_to=frozenset({"buyer", "platform_admin"}),
+    description="Process payment for an order. HIGH risk — financial. Requires user confirmation.",
+)
+
+GET_PAYMENT_STATUS = ToolMeta(
+    name="get_payment_status",
+    method="GET",
+    path="/payments/{payment_id}",
+    risk_tier=RiskTier.READ_ONLY,
+    requires_confirmation=False,
+    visible_to=ROLES,
+    description="Get payment status. Read-only.",
+)
+
+REQUEST_REFUND = ToolMeta(
+    name="request_refund",
+    method="POST",
+    path="/payments/{payment_id}/refund",
+    risk_tier=RiskTier.HIGH,
+    requires_confirmation=True,
+    visible_to=frozenset({"merchant_owner", "merchant_staff", "platform_admin"}),
+    description="Request a refund. HIGH risk — financial. Requires user confirmation.",
+)
+
+# ── Ledger tools ────────────────────────────────────────────────────────
+GET_MERCHANT_BALANCE = ToolMeta(
+    name="get_merchant_balance",
+    method="GET",
+    path="/ledger/balance/{merchant_id}",
+    risk_tier=RiskTier.READ_ONLY,
+    requires_confirmation=False,
+    visible_to=frozenset({"merchant_owner", "merchant_staff", "platform_admin"}),
+    description="Get merchant balance. Read-only, merchant-scoped.",
+)
+
+GET_MERCHANT_LEDGER = ToolMeta(
+    name="get_merchant_ledger",
+    method="GET",
+    path="/ledger/entries",
+    risk_tier=RiskTier.READ_ONLY,
+    requires_confirmation=False,
+    visible_to=frozenset({"merchant_owner", "merchant_staff", "platform_admin"}),
+    description="Get merchant ledger entries. Read-only, merchant-scoped.",
+)
+
+# ── Fulfillment tools ───────────────────────────────────────────────────
+GET_FULFILLMENT_STATUS = ToolMeta(
+    name="get_fulfillment_status",
+    method="GET",
+    path="/fulfillment/order/{order_id}",
+    risk_tier=RiskTier.READ_ONLY,
+    requires_confirmation=False,
+    visible_to=ROLES,
+    description="Get fulfillment status for an order. Read-only.",
+)
+
+LIST_FULFILLMENTS = ToolMeta(
+    name="list_fulfillments",
+    method="GET",
+    path="/fulfillment/",
+    risk_tier=RiskTier.READ_ONLY,
+    requires_confirmation=False,
+    visible_to=frozenset({"merchant_owner", "merchant_staff", "platform_admin"}),
+    description="List fulfillments for a merchant. Read-only.",
+)
+
+CREATE_FULFILLMENT = ToolMeta(
+    name="create_fulfillment",
+    method="POST",
+    path="/fulfillment/",
+    risk_tier=RiskTier.MEDIUM,
+    requires_confirmation=False,
+    visible_to=frozenset({"merchant_owner", "merchant_staff", "platform_admin"}),
+    description="Create a fulfillment record. Medium risk — mutating, non-financial.",
+)
+
+UPDATE_FULFILLMENT_STATUS = ToolMeta(
+    name="update_fulfillment_status",
+    method="PUT",
+    path="/fulfillment/{fulfillment_id}/status",
+    risk_tier=RiskTier.MEDIUM,
+    requires_confirmation=False,
+    visible_to=frozenset({"merchant_owner", "merchant_staff", "platform_admin"}),
+    description="Update fulfillment status. Medium risk — mutating, non-financial.",
+)
+
+# ── Merchant tools ──────────────────────────────────────────────────────
+GET_ORDER_STATUS = ToolMeta(
+    name="get_order_status",
+    method="GET",
+    path="/orders/{order_id}",
+    risk_tier=RiskTier.READ_ONLY,
+    requires_confirmation=False,
+    visible_to=ROLES,
+    description="Get the status of an order. Read-only.",
+)
+
+LIST_ORDERS = ToolMeta(
+    name="list_orders",
+    method="GET",
+    path="/orders/",
+    risk_tier=RiskTier.READ_ONLY,
+    requires_confirmation=False,
+    visible_to=ROLES,
+    description="List orders for the current user (role-scoped). Read-only.",
+)
+
+
+# ── Merchant tools ────────────────────────────────────────────────────
+GET_MERCHANT_ORDERS = ToolMeta(
+    name="get_merchant_orders",
+    method="GET",
+    path="/merchants/{merchant_id}/orders",
+    risk_tier=RiskTier.READ_ONLY,
+    requires_confirmation=False,
+    visible_to=frozenset({"merchant_owner", "merchant_staff", "platform_admin"}),
+    description="List orders for a merchant. Read-only, merchant-scoped.",
+)
+
+GET_MERCHANT_PROFILE = ToolMeta(
+    name="get_merchant_profile",
+    method="GET",
+    path="/merchants/{merchant_id}",
+    risk_tier=RiskTier.READ_ONLY,
+    requires_confirmation=False,
+    visible_to=frozenset({"merchant_owner", "platform_admin"}),
+    description="Get merchant profile. Read-only.",
+)
+
+LIST_MERCHANTS = ToolMeta(
+    name="list_merchants",
+    method="GET",
+    path="/merchants/",
+    risk_tier=RiskTier.READ_ONLY,
+    requires_confirmation=False,
+    visible_to=frozenset({"platform_admin"}),
+    description="List all merchants. Admin only. Read-only.",
+)
+
+# ── Product management (merchant) ─────────────────────────────────────
+CREATE_PRODUCT = ToolMeta(
+    name="create_product",
+    method="POST",
+    path="/catalog/products",
+    risk_tier=RiskTier.MEDIUM,
+    requires_confirmation=False,
+    visible_to=frozenset({"merchant_owner", "merchant_staff", "platform_admin"}),
+    description="Create a new product. Medium risk — mutating, non-financial.",
+)
+
+UPDATE_INVENTORY = ToolMeta(
+    name="update_inventory",
+    method="PUT",
+    path="/catalog/inventory/{variant_id}",
+    risk_tier=RiskTier.MEDIUM,
+    requires_confirmation=False,
+    visible_to=frozenset({"merchant_owner", "merchant_staff", "platform_admin"}),
+    description="Update inventory for a variant. Medium risk — mutating, non-financial.",
+)
+
+# ── Admin tools ─────────────────────────────────────────────────────────
+REVIEW_KYC = ToolMeta(
+    name="review_kyc",
+    method="PATCH",
+    path="/admin/merchants/{merchant_id}/kyc",
+    risk_tier=RiskTier.HIGH,
+    requires_confirmation=True,
+    visible_to=frozenset({"platform_admin"}),
+    description="Review/approve/reject merchant KYC. HIGH risk — admin-only. Requires confirmation.",
+)
+
+REQUEST_PAYOUT = ToolMeta(
+    name="request_payout",
+    method="POST",
+    path="/merchants/{merchant_id}/payouts",
+    risk_tier=RiskTier.HIGH,
+    requires_confirmation=True,
+    visible_to=frozenset({"merchant_owner", "platform_admin"}),
+    description="Request a payout. HIGH risk — financial. Requires confirmation + MFA step-up.",
+)
+
+# ── Ledger tools ────────────────────────────────────────────────────────
+GET_MERCHANT_BALANCE = ToolMeta(
+    name="get_merchant_balance",
+    method="GET",
+    path="/merchants/{merchant_id}/balance",
+    risk_tier=RiskTier.READ_ONLY,
+    requires_confirmation=False,
+    visible_to=frozenset({"merchant_owner", "merchant_staff", "platform_admin"}),
+    description="Get merchant balance. Read-only, merchant-scoped.",
+)
+
+GET_MERCHANT_LEDGER = ToolMeta(
+    name="get_merchant_ledger",
+    method="GET",
+    path="/ledger/entries",
+    risk_tier=RiskTier.READ_ONLY,
+    requires_confirmation=False,
+    visible_to=frozenset({"merchant_owner", "merchant_staff", "platform_admin"}),
+    description="Get merchant ledger entries. Read-only, merchant-scoped.",
+)
+
+# ── Registry ─────────────────────────────────────────────────────────────
+ALL_TOOLS: tuple[ToolMeta, ...] = (
+    SEARCH_PRODUCTS,
+    GET_PRODUCT_DETAIL,
+    GET_CATEGORIES,
+    SEMANTIC_SEARCH,
+    GET_USER_PROFILE,
+    ADD_TO_CART,
+    VIEW_CART,
+    REMOVE_FROM_CART,
+    CLEAR_CART,
+    INITIATE_CHECKOUT,
+    GET_ORDER_STATUS,
+    LIST_ORDERS,
+    PROCESS_PAYMENT,
+    GET_PAYMENT_STATUS,
+    REQUEST_REFUND,
+    GET_MERCHANT_BALANCE,
+    GET_MERCHANT_LEDGER,
+    GET_FULFILLMENT_STATUS,
+    LIST_FULFILLMENTS,
+    CREATE_FULFILLMENT,
+    UPDATE_FULFILLMENT_STATUS,
+    GET_MERCHANT_PROFILE,
+    LIST_MERCHANTS,
+    CREATE_PRODUCT,
+    UPDATE_INVENTORY,
+    REVIEW_KYC,
+    REQUEST_PAYOUT,
+)
+
+BY_NAME: dict[str, ToolMeta] = {t.name: t for t in ALL_TOOLS}
+
+
+def tools_for_role(role: str | None) -> list[ToolMeta]:
+    """Return the tools visible to the given role (cosmetic filter, not security)."""
+    if role is None:
+        role = "anonymous"
+    return [t for t in ALL_TOOLS if role in t.visible_to]
+
+
+def is_mutating_financial(tool_name: str) -> bool:
+    """Whether the tool requires the confirmation gate."""
+    meta = BY_NAME.get(tool_name)
+    return meta.requires_confirmation if meta else False
+
