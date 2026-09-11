@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from collections.abc import AsyncIterator
@@ -69,21 +70,42 @@ def _load_system_prompt() -> str:
 async def lifespan(app: FastAPI):
     config = app.state.config
     app.state.redis = _create_redis(config["redis_url"])
-    # Fail fast if Redis is unreachable — sessions, confirmation gate,
-    # debug tracing, and the RAG vector store all depend on it.
-    try:
-        await app.state.redis.ping()
-    except Exception as exc:
-        raise RuntimeError(
-            f"Cannot connect to Redis at {config['redis_url']}: {exc}. "
-            "Start Redis (e.g. `redis-server`) or set REDIS_URL."
-        ) from exc
+    app.state.redis_connected = False
+
+    # Start background task to connect to Redis (don't block startup)
+    redis_connected = asyncio.Event()
+
+    async def _connect_redis():
+        """Background task to establish Redis connection with retries."""
+        retry_delay = 1.0
+        max_retry_delay = 30.0
+        while True:
+            try:
+                await app.state.redis.ping()
+                app.state.redis_connected = True
+                redis_connected.set()
+                print(f"[GATEWAY] Redis connected successfully")
+                return
+            except Exception as exc:
+                app.state.redis_connected = False
+                print(f"[GATEWAY] Redis connection failed: {exc}. Retrying in {retry_delay:.0f}s...")
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, max_retry_delay)
+
+    # Start Redis connection in background
+    redis_task = asyncio.create_task(_connect_redis())
+
     app.state.backend_client = None
     app.state.gate = None
     app.state.model_backend = None
     app.state.debug_tracer = None
     app.state.agent = None
     yield
+    redis_task.cancel()
+    try:
+        await redis_task
+    except asyncio.CancelledError:
+        pass
     await app.state.redis.close()
 
 
@@ -125,11 +147,23 @@ def create_app() -> FastAPI:
 
     def get_model_backend():
         if app.state.model_backend is None:
-            from .provider import get_backend
             provider = config["model_provider"]
-            model = config["model_name"]
             api_key = config["nvidia_api_key"] if provider == "nvidia" else config["anthropic_api_key"]
-            app.state.model_backend = get_backend(provider, model, api_key)
+
+            # Use FailoverBackend for NVIDIA to enable model switching
+            if provider == "nvidia":
+                from .model_router import FailoverBackend, NIM_MODELS
+                # Allow custom model list via env var, fallback to default NIM_MODELS
+                app.state.model_backend = FailoverBackend(
+                    models=NIM_MODELS,
+                    api_key=api_key,
+                )
+                print(f"[GATEWAY] Initialized FailoverBackend with {len(NIM_MODELS)} models")
+                print(f"[GATEWAY] Primary model: {NIM_MODELS[0].name}")
+            else:
+                from .provider import get_backend
+                model = config["model_name"]
+                app.state.model_backend = get_backend(provider, model, api_key)
         return app.state.model_backend
 
     def get_agent():
@@ -151,20 +185,14 @@ def create_app() -> FastAPI:
 
     @app.get("/health")
     async def health():
-        try:
-            await app.state.redis.ping()
-            redis_status = "ok"
-        except Exception as exc:
-            redis_status = f"error: {exc}"
+        redis_status = "connected" if app.state.redis_connected else "disconnected"
         return {"status": "ok", "service": "agent-gateway", "redis": redis_status}
 
     @app.get("/ready")
     async def ready():
         """Readiness probe — verifies Redis connectivity for orchestrators."""
-        try:
-            await app.state.redis.ping()
-        except Exception as exc:
-            raise HTTPException(503, f"Redis unavailable: {exc}")
+        if not app.state.redis_connected:
+            raise HTTPException(503, "Redis unavailable")
         return {"ready": True, "redis": "ok"}
 
     @app.post("/sse")

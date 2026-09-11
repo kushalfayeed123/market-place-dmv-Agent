@@ -28,7 +28,11 @@ def _is_rate_limit_error(status_code: int, response_text: str) -> bool:
     if status_code == 503:
         # Check for resource exhaustion messages
         lower_text = response_text.lower()
-        return "resourceexhausted" in lower_text or "rate limit" in lower_text or "request limit" in lower_text
+        return (
+            "resourceexhausted" in lower_text
+            or "rate limit" in lower_text
+            or "request limit" in lower_text
+        )
     return False
 
 
@@ -48,25 +52,36 @@ async def _retry_with_backoff(
             if isinstance(result, dict) and result.get("error"):
                 error_msg = result.get("error", "")
                 # Check if error message indicates a retryable error
-                if any(code in error_msg for code in ["429", "500", "502", "503", "504"]):
-                    if attempt < max_retries:
-                        delay = base_delay * (2 ** attempt)
-                        print(f"[NVIDIA] Retryable error detected, retrying in {delay:.1f}s (attempt {attempt + 1}/{max_retries})")
-                        await asyncio.sleep(delay)
-                        continue
+                if (
+                    any(
+                        code in error_msg
+                        for code in ["429", "500", "502", "503", "504"]
+                    )
+                    and attempt < max_retries
+                ):
+                    delay = base_delay * (2**attempt)
+                    print(
+                        f"[NVIDIA] Retryable error detected, retrying in {delay:.1f}s (attempt {attempt + 1}/{max_retries})"
+                    )
+                    await asyncio.sleep(delay)
+                    continue
             return result
         except httpx.TimeoutException:
             if attempt < max_retries:
-                delay = base_delay * (2 ** attempt)
-                print(f"[NVIDIA] Request timed out, retrying in {delay:.1f}s (attempt {attempt + 1}/{max_retries})")
+                delay = base_delay * (2**attempt)
+                print(
+                    f"[NVIDIA] Request timed out, retrying in {delay:.1f}s (attempt {attempt + 1}/{max_retries})"
+                )
                 await asyncio.sleep(delay)
                 continue
             raise
         except Exception as e:
             last_exception = e
             if attempt < max_retries:
-                delay = base_delay * (2 ** attempt)
-                print(f"[NVIDIA] Error: {e}, retrying in {delay:.1f}s (attempt {attempt + 1}/{max_retries})")
+                delay = base_delay * (2**attempt)
+                print(
+                    f"[NVIDIA] Error: {e}, retrying in {delay:.1f}s (attempt {attempt + 1}/{max_retries})"
+                )
                 await asyncio.sleep(delay)
                 continue
             raise
@@ -122,6 +137,11 @@ class NvidiaBackend(ModelBackend):
             "Accept": "application/json",
         }
 
+        # Log the request payload
+        print(
+            f"[NVIDIA] Classification payload: model={self._model}, message={message[:100]}..."
+        )
+
         async def _do_classify() -> dict[str, Any]:
             async with httpx.AsyncClient(timeout=self._timeout) as client:
                 resp = await client.post(
@@ -132,7 +152,12 @@ class NvidiaBackend(ModelBackend):
                 if resp.status_code != 200:
                     error_msg = f"API error {resp.status_code}: {resp.text[:200]}"
                     print(f"[NVIDIA] Classification API error: {error_msg}")
-                    return {"intent": "info", "confidence": 0.0, "reasoning": "", "error": error_msg}
+                    return {
+                        "intent": "info",
+                        "confidence": 0.0,
+                        "reasoning": "",
+                        "error": error_msg,
+                    }
                 data = resp.json()
                 content = data["choices"][0]["message"]["content"]
                 print(f"[NVIDIA] Classification response: {content[:200]}")
@@ -143,7 +168,12 @@ class NvidiaBackend(ModelBackend):
         except Exception as e:
             error_msg = f"Exception: {e!s}"
             print(f"[NVIDIA] Classification error: {error_msg}")
-            return {"intent": "info", "confidence": 0.0, "reasoning": "", "error": error_msg}
+            return {
+                "intent": "info",
+                "confidence": 0.0,
+                "reasoning": "",
+                "error": error_msg,
+            }
 
     async def stream(
         self,
@@ -170,9 +200,17 @@ class NvidiaBackend(ModelBackend):
             "Accept": "application/json",
         }
 
+        # Log the request payload
+        user_msg = messages[0].get("content", "")[:100] if messages else ""
+        print(
+            f"[NVIDIA] Stream payload: model={self._model}, tools={len(tools)}, messages={len(messages)}, user_message={user_msg}..."
+        )
+
         # Retry loop for rate limiting
         for attempt in range(MAX_RETRIES + 1):
-            print(f"[NVIDIA] Streaming request to {self._model} with {len(tools)} tools (attempt {attempt + 1})")
+            print(
+                f"[NVIDIA] Streaming request to {self._model} with {len(tools)} tools (attempt {attempt + 1})"
+            )
             try:
                 async with (
                     httpx.AsyncClient(timeout=self._timeout) as client,
@@ -189,8 +227,11 @@ class NvidiaBackend(ModelBackend):
                         print(f"[NVIDIA] Stream error: {error_msg}")
 
                         # Check if this is a retryable error
-                        if _is_rate_limit_error(response.status_code, body.decode()) and attempt < MAX_RETRIES:
-                            delay = BASE_RETRY_DELAY * (2 ** attempt)
+                        if (
+                            _is_rate_limit_error(response.status_code, body.decode())
+                            and attempt < MAX_RETRIES
+                        ):
+                            delay = BASE_RETRY_DELAY * (2**attempt)
                             print(f"[NVIDIA] Rate limited, retrying in {delay:.1f}s...")
                             await asyncio.sleep(delay)
                             continue
@@ -205,7 +246,9 @@ class NvidiaBackend(ModelBackend):
                     async for event in _parse_sse(response, tools):
                         event_count += 1
                         if event.get("type") == "tool_calls":
-                            print(f"[NVIDIA] Stream yielded tool_calls event: {[tc.get('name') for tc in event.get('tool_calls', [])]}")
+                            print(
+                                f"[NVIDIA] Stream yielded tool_calls event: {[tc.get('name') for tc in event.get('tool_calls', [])]}"
+                            )
                         yield event
                     print(f"[NVIDIA] Stream completed with {event_count} events")
                     return  # Success, exit retry loop
@@ -214,7 +257,7 @@ class NvidiaBackend(ModelBackend):
                 error_msg = "NVIDIA API request timed out"
                 print(f"[NVIDIA] {error_msg}")
                 if attempt < MAX_RETRIES:
-                    delay = BASE_RETRY_DELAY * (2 ** attempt)
+                    delay = BASE_RETRY_DELAY * (2**attempt)
                     print(f"[NVIDIA] Retrying in {delay:.1f}s...")
                     await asyncio.sleep(delay)
                     continue
@@ -224,7 +267,7 @@ class NvidiaBackend(ModelBackend):
                 error_msg = f"Unexpected error: {e!s}"
                 print(f"[NVIDIA] {error_msg}")
                 if attempt < MAX_RETRIES:
-                    delay = BASE_RETRY_DELAY * (2 ** attempt)
+                    delay = BASE_RETRY_DELAY * (2**attempt)
                     print(f"[NVIDIA] Retrying in {delay:.1f}s...")
                     await asyncio.sleep(delay)
                     continue
@@ -232,7 +275,9 @@ class NvidiaBackend(ModelBackend):
                 return
 
 
-async def _parse_sse(response: httpx.Response, tools: list[dict[str, Any]]) -> AsyncIterator[dict[str, Any]]:
+async def _parse_sse(
+    response: httpx.Response, tools: list[dict[str, Any]]
+) -> AsyncIterator[dict[str, Any]]:
     """Parse NVIDIA's SSE stream into structured events."""
     tool_calls_buffer: dict[int, dict[str, Any]] = {}
 
@@ -285,15 +330,22 @@ async def _parse_sse(response: httpx.Response, tools: list[dict[str, Any]]) -> A
                 tool_calls = []
                 for idx in sorted(tool_calls_buffer):
                     buf = tool_calls_buffer[idx]
+                    # Keep arguments as JSON string for API compatibility
+                    args_str = buf["function"]["arguments"]
                     try:
-                        args = json.loads(buf["function"]["arguments"])
+                        json.loads(args_str)  # Validate it's valid JSON
                     except json.JSONDecodeError:
-                        args = {}
-                    tool_calls.append({
-                        "id": buf["id"],
-                        "name": buf["function"]["name"],
-                        "arguments": args,
-                    })
+                        args_str = "{}"
+                    tool_calls.append(
+                        {
+                            "id": buf["id"],
+                            "type": "function",
+                            "function": {
+                                "name": buf["function"]["name"],
+                                "arguments": args_str,
+                            },
+                        }
+                    )
                 yield {"type": "tool_calls", "tool_calls": tool_calls}
 
             # Usage
@@ -324,6 +376,16 @@ def _parse_classification(content: str, valid_intents: list[str]) -> dict[str, A
     content_lower = content.lower().strip()
     for intent in valid_intents:
         if intent in content_lower:
-            return {"intent": intent, "confidence": 0.7, "reasoning": content.strip(), "error": None}
+            return {
+                "intent": intent,
+                "confidence": 0.7,
+                "reasoning": content.strip(),
+                "error": None,
+            }
     # Default fallback
-    return {"intent": "info", "confidence": 0.5, "reasoning": content.strip(), "error": None}
+    return {
+        "intent": "info",
+        "confidence": 0.5,
+        "reasoning": content.strip(),
+        "error": None,
+    }
