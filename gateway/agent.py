@@ -79,15 +79,57 @@ class Agent:
         messages = [{"role": "user", "content": user_message}]
 
         self._debug.log_model_call(session_id, turn_id, self._model.provider_name, self._model.model_name)
+        print(f"[AGENT] Starting model stream with {len(tool_defs)} tools available")
+        print(f"[AGENT] Available tools: {[t['function']['name'] for t in tool_defs[:5]]}...")
 
         try:
+            event_count = 0
+            error_events: list[str] = []
             async for event in self._model.stream(
                 messages=messages, tools=tool_defs, system_prompt=self._system_prompt,
             ):
+                event_count += 1
+                print(f"[AGENT] Model event #{event_count}: type={event.get('type')}")
+                # Collect error events to display to user
+                if event.get("type") == "error":
+                    error_events.append(event.get("error", "Unknown error"))
                 async for output in self._handle_event(event, session, turn_id, confirmed_token):
                     yield output
+            print(f"[AGENT] Model stream completed with {event_count} events")
+
+            # Handle empty stream case
+            if event_count == 0:
+                print("[AGENT] WARNING: Model stream returned no events")
+                yield {
+                    "type": "error",
+                    "error": "I apologize, but I'm having trouble processing your request right now. "
+                             "The AI service appears to be temporarily unavailable. Please try again in a moment.",
+                }
+            elif error_events and event_count == len(error_events):
+                # All events were errors
+                print(f"[AGENT] WARNING: All model events were errors: {error_events}")
+                # Check for rate limit errors
+                rate_limit_indicators = ["rate limit", "resourceexhausted", "request limit", "429", "503"]
+                is_rate_limit = any(
+                    indicator in error.lower()
+                    for error in error_events
+                    for indicator in rate_limit_indicators
+                )
+                if is_rate_limit:
+                    yield {
+                        "type": "error",
+                        "error": "I apologize, but the AI service is currently experiencing high demand. "
+                                 "Please wait a moment and try again.",
+                    }
+                else:
+                    yield {
+                        "type": "error",
+                        "error": "I apologize, but I encountered an error while processing your request. "
+                                 "Please try again.",
+                    }
         except Exception as e:
             self._debug.log_error(session_id, turn_id, "agent_error", str(e))
+            print(f"[AGENT] Error during model stream: {e}")
             yield {"type": "error", "error": f"Agent error: {e!s}"}
 
     async def _handle_event(
@@ -262,15 +304,221 @@ class Agent:
         component = component_map.get(tool_name)
         if not component:
             return None
-        return UIDirective(component=component, props=result.get("data", {}), correlation_id=session_id).model_dump()
+        data = result.get("data", {})
+        # Wrap list data in a dict with 'items' key since UIDirective.props expects a dict
+        if isinstance(data, list):
+            props = {"items": data}
+        else:
+            props = data
+        return UIDirective(component=component, props=props, correlation_id=session_id).model_dump()
 
 
 def _tool_to_openai_format(tool_meta: Any) -> dict[str, Any]:
-    """Convert a ToolMeta to OpenAI function-calling format."""
+    """Convert a ToolMeta to OpenAI function-calling format with proper parameters."""
+    # Define parameters for each tool based on its purpose
+    tool_parameters = _get_tool_parameters(tool_meta.name)
     return {
         "type": "function",
-        "function": {"name": tool_meta.name, "description": tool_meta.description, "parameters": {"type": "object", "properties": {}}},
+        "function": {
+            "name": tool_meta.name,
+            "description": tool_meta.description,
+            "parameters": tool_parameters,
+        },
     }
+
+
+def _get_tool_parameters(tool_name: str) -> dict[str, Any]:
+    """Return the parameter schema for a given tool name."""
+    # Tool parameter definitions for the OpenAI function-calling format
+    tool_schemas: dict[str, dict[str, Any]] = {
+        "search_products": {
+            "type": "object",
+            "properties": {
+                "q": {"type": "string", "description": "Search query string (e.g., 'hp laptop', 'iphone 15')"},
+                "category": {"type": "string", "description": "Optional category filter"},
+                "min_price": {"type": "number", "description": "Optional minimum price filter"},
+                "max_price": {"type": "number", "description": "Optional maximum price filter"},
+                "limit": {"type": "integer", "description": "Maximum number of results to return (default 20)"},
+            },
+            "required": ["q"],
+        },
+        "get_product_detail": {
+            "type": "object",
+            "properties": {
+                "product_id": {"type": "string", "description": "The unique identifier of the product"},
+            },
+            "required": ["product_id"],
+        },
+        "get_categories": {"type": "object", "properties": {}},
+        "semantic_search": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Natural language search query"},
+                "limit": {"type": "integer", "description": "Maximum number of results (default 10)"},
+            },
+            "required": ["query"],
+        },
+        "get_user_profile": {"type": "object", "properties": {}},
+        "add_to_cart": {
+            "type": "object",
+            "properties": {
+                "product_id": {"type": "string", "description": "The product ID to add to cart"},
+                "variant_id": {"type": "string", "description": "Optional variant ID (e.g., color, size)"},
+                "quantity": {"type": "integer", "description": "Quantity to add (default 1)"},
+            },
+            "required": ["product_id"],
+        },
+        "view_cart": {"type": "object", "properties": {}},
+        "remove_from_cart": {
+            "type": "object",
+            "properties": {
+                "item_id": {"type": "string", "description": "The cart item ID to remove"},
+            },
+            "required": ["item_id"],
+        },
+        "clear_cart": {"type": "object", "properties": {}},
+        "initiate_checkout": {
+            "type": "object",
+            "properties": {
+                "user_confirmed_token": {"type": "string", "description": "Confirmation token from the user"},
+            },
+            "required": ["user_confirmed_token"],
+        },
+        "get_order_status": {
+            "type": "object",
+            "properties": {
+                "order_id": {"type": "string", "description": "The order ID to check"},
+            },
+            "required": ["order_id"],
+        },
+        "list_orders": {
+            "type": "object",
+            "properties": {
+                "status": {"type": "string", "description": "Optional status filter (e.g., 'pending', 'shipped')"},
+                "limit": {"type": "integer", "description": "Maximum number of orders to return"},
+            },
+        },
+        "process_payment": {
+            "type": "object",
+            "properties": {
+                "order_id": {"type": "string", "description": "The order ID to process payment for"},
+                "payment_method": {"type": "string", "description": "Payment method (e.g., 'credit_card', 'paypal')"},
+                "user_confirmed_token": {"type": "string", "description": "Confirmation token from the user"},
+            },
+            "required": ["order_id", "user_confirmed_token"],
+        },
+        "get_payment_status": {
+            "type": "object",
+            "properties": {
+                "payment_id": {"type": "string", "description": "The payment ID to check"},
+            },
+            "required": ["payment_id"],
+        },
+        "request_refund": {
+            "type": "object",
+            "properties": {
+                "order_id": {"type": "string", "description": "The order ID to request refund for"},
+                "reason": {"type": "string", "description": "Reason for the refund"},
+                "user_confirmed_token": {"type": "string", "description": "Confirmation token from the user"},
+            },
+            "required": ["order_id", "user_confirmed_token"],
+        },
+        "get_merchant_balance": {
+            "type": "object",
+            "properties": {
+                "merchant_id": {"type": "string", "description": "The merchant ID"},
+            },
+            "required": ["merchant_id"],
+        },
+        "get_merchant_ledger": {
+            "type": "object",
+            "properties": {
+                "merchant_id": {"type": "string", "description": "The merchant ID"},
+                "limit": {"type": "integer", "description": "Maximum number of entries to return"},
+            },
+            "required": ["merchant_id"],
+        },
+        "get_fulfillment_status": {
+            "type": "object",
+            "properties": {
+                "order_id": {"type": "string", "description": "The order ID to check fulfillment for"},
+            },
+            "required": ["order_id"],
+        },
+        "list_fulfillments": {
+            "type": "object",
+            "properties": {
+                "status": {"type": "string", "description": "Optional status filter"},
+                "limit": {"type": "integer", "description": "Maximum number to return"},
+            },
+        },
+        "create_fulfillment": {
+            "type": "object",
+            "properties": {
+                "order_id": {"type": "string", "description": "The order ID to create fulfillment for"},
+                "tracking_number": {"type": "string", "description": "Optional tracking number"},
+            },
+            "required": ["order_id"],
+        },
+        "update_fulfillment_status": {
+            "type": "object",
+            "properties": {
+                "order_id": {"type": "string", "description": "The order ID"},
+                "status": {"type": "string", "description": "New fulfillment status"},
+            },
+            "required": ["order_id", "status"],
+        },
+        "get_merchant_profile": {
+            "type": "object",
+            "properties": {
+                "merchant_id": {"type": "string", "description": "The merchant ID"},
+            },
+            "required": ["merchant_id"],
+        },
+        "list_merchants": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "description": "Maximum number to return"},
+            },
+        },
+        "create_product": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Product name"},
+                "description": {"type": "string", "description": "Product description"},
+                "price": {"type": "number", "description": "Product price"},
+                "category": {"type": "string", "description": "Product category"},
+            },
+            "required": ["name", "price"],
+        },
+        "update_inventory": {
+            "type": "object",
+            "properties": {
+                "variant_id": {"type": "string", "description": "The variant ID"},
+                "quantity": {"type": "integer", "description": "New quantity"},
+            },
+            "required": ["variant_id", "quantity"],
+        },
+        "review_kyc": {
+            "type": "object",
+            "properties": {
+                "merchant_id": {"type": "string", "description": "The merchant ID"},
+                "decision": {"type": "string", "description": "KYC decision: 'approve' or 'reject'"},
+                "user_confirmed_token": {"type": "string", "description": "Confirmation token from the user"},
+            },
+            "required": ["merchant_id", "decision", "user_confirmed_token"],
+        },
+        "request_payout": {
+            "type": "object",
+            "properties": {
+                "merchant_id": {"type": "string", "description": "The merchant ID"},
+                "amount": {"type": "number", "description": "Payout amount"},
+                "user_confirmed_token": {"type": "string", "description": "Confirmation token from the user"},
+            },
+            "required": ["merchant_id", "amount", "user_confirmed_token"],
+        },
+    }
+    return tool_schemas.get(tool_name, {"type": "object", "properties": {}})
 
 
 def _summarize_args(args: dict[str, Any]) -> dict[str, Any]:
@@ -293,21 +541,63 @@ def _result_to_text(tool_name: str, result: dict[str, Any]) -> str | None:
         if isinstance(items, list):
             count = len(items)
             query = data.get("q", "") if isinstance(data, dict) else ""
+            # Build a more detailed summary with product names and prices
+            if count == 0:
+                if query:
+                    return f"I couldn't find any products matching '{query}'. Try a different search term."
+                return "I couldn't find any products. Try a different search."
+            # Get product names and prices for a more informative summary
+            product_details = []
+            for item in items[:5]:  # Limit to first 5 products
+                name = item.get("name", "Unknown Product")
+                price_amount = item.get("price", {}).get("amount") if isinstance(item.get("price"), dict) else None
+                price_currency = item.get("price", {}).get("currency", "") if isinstance(item.get("price"), dict) else ""
+                if price_amount is not None:
+                    product_details.append(f"{name} ({price_currency} {price_amount})")
+                else:
+                    product_details.append(name)
+            summary_parts = [f"Found {count} product{'s' if count != 1 else ''}"]
             if query:
-                return f"Found {count} product{'s' if count != 1 else ''} matching '{query}'."
-            return f"Found {count} product{'s' if count != 1 else ''}."
+                summary_parts.append(f"matching '{query}'")
+            summary_parts.append(":")
+            summary_parts.append("; ".join(product_details))
+            if count > 5:
+                summary_parts.append(f"... and {count - 5} more")
+            return " ".join(summary_parts)
         return "Here are the products."
 
     if tool_name == "get_product_detail":
-        name = data.get("name", "") if isinstance(data, dict) else ""
-        if name:
-            return f"Here's the details for {name}."
+        if isinstance(data, dict):
+            name = data.get("name", "")
+            price_amount = data.get("price", {}).get("amount") if isinstance(data.get("price"), dict) else None
+            price_currency = data.get("price", {}).get("currency", "") if isinstance(data.get("price"), dict) else ""
+            description = data.get("description", "")
+            variants = data.get("variants", [])
+            details_parts = [f"Here's the details for {name}"]
+            if price_amount is not None:
+                details_parts.append(f"- Price: {price_currency} {price_amount}")
+            if description:
+                # Truncate long descriptions
+                desc_short = description[:100] + "..." if len(description) > 100 else description
+                details_parts.append(f"Description: {desc_short}")
+            if variants:
+                details_parts.append(f"Available in {len(variants)} variant{'s' if len(variants) != 1 else ''}")
+            return ". ".join(details_parts) + "."
         return "Here are the product details."
 
     if tool_name == "get_categories":
         if isinstance(data, list):
             count = len(data)
-            return f"Found {count} categor{'ies' if count != 1 else 'y'}."
+            if count == 0:
+                return "No categories found."
+            # Include category names for a more informative summary
+            category_names = [c.get("name", "Unknown") for c in data[:5] if isinstance(c, dict)]
+            summary = f"Found {count} categor{'ies' if count != 1 else 'y'}"
+            if category_names:
+                summary += ": " + ", ".join(category_names)
+                if count > 5:
+                    summary += f", and {count - 5} more"
+            return summary + "."
         return "Here are the categories."
 
     if tool_name == "semantic_search":
@@ -322,13 +612,31 @@ def _result_to_text(tool_name: str, result: dict[str, Any]) -> str | None:
         items = data.get("items", []) if isinstance(data, dict) else []
         if isinstance(items, list) and items:
             count = len(items)
-            return f"Your cart has {count} item{'s' if count != 1 else ''}."
+            # Calculate total if available
+            total_amount = data.get("total", {}).get("amount") if isinstance(data.get("total"), dict) else None
+            total_currency = data.get("total", {}).get("currency", "") if isinstance(data.get("total"), dict) else ""
+            item_names = [i.get("name", i.get("product_name", "Item")) for i in items[:3] if isinstance(i, dict)]
+            summary = f"Your cart has {count} item{'s' if count != 1 else ''}"
+            if item_names:
+                summary += ": " + ", ".join(item_names)
+                if count > 3:
+                    summary += f", and {count - 3} more"
+            if total_amount is not None:
+                summary += f". Total: {total_currency} {total_amount}"
+            return summary + "."
         return "Your cart is empty."
 
     if tool_name == "add_to_cart":
+        product_name = data.get("name", data.get("product_name", "")) if isinstance(data, dict) else ""
+        if product_name:
+            return f"Added '{product_name}' to your cart."
         return "Item added to your cart."
 
     if tool_name == "initiate_checkout":
+        order_id = data.get("order_id", "") if isinstance(data, dict) else ""
+        total = data.get("total", {}).get("amount") if isinstance(data.get("total"), dict) else None
+        if order_id and total:
+            return f"Checkout initiated for order {order_id}. Total amount: {total}."
         return "Checkout initiated. Here are your order details."
 
     if tool_name == "get_order_status":
@@ -341,23 +649,46 @@ def _result_to_text(tool_name: str, result: dict[str, Any]) -> str | None:
     if tool_name == "list_orders":
         if isinstance(data, list):
             count = len(data)
-            return f"Found {count} order{'s' if count != 1 else ''}."
+            if count == 0:
+                return "You have no orders yet."
+            # Include order IDs and statuses for a more informative summary
+            order_details = []
+            for order in data[:5]:
+                if isinstance(order, dict):
+                    order_id = order.get("order_id", order.get("id", ""))
+                    status = order.get("status", "")
+                    if order_id and status:
+                        order_details.append(f"{order_id} ({status})")
+                    elif order_id:
+                        order_details.append(str(order_id))
+            summary = f"Found {count} order{'s' if count != 1 else ''}"
+            if order_details:
+                summary += ": " + "; ".join(order_details)
+                if count > 5:
+                    summary += f"... and {count - 5} more"
+            return summary + "."
         return "Here are your orders."
 
     if tool_name == "get_merchant_balance":
         balance = data.get("balance", "") if isinstance(data, dict) else ""
+        currency = data.get("currency", "") if isinstance(data, dict) else ""
         if balance:
-            return f"Current merchant balance: {balance}."
+            return f"Current merchant balance: {currency} {balance}."
         return "Here's the merchant balance."
 
     if tool_name == "get_merchant_ledger":
         if isinstance(data, list):
             count = len(data)
+            if count == 0:
+                return "No ledger entries found."
             return f"Found {count} ledger entr{'ies' if count != 1 else 'y'}."
         return "Here's the merchant ledger."
 
     if tool_name == "get_fulfillment_status":
         status = data.get("status", "") if isinstance(data, dict) else ""
+        order_id = data.get("order_id", "") if isinstance(data, dict) else ""
+        if status and order_id:
+            return f"Fulfillment status for order {order_id}: {status}."
         if status:
             return f"Fulfillment status: {status}."
         return "Here's the fulfillment status."
