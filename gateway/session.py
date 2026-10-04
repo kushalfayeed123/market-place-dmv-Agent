@@ -34,6 +34,11 @@ class Session:
         self.turn_counter: int = 0
         self._cart: dict = {"items": []}
 
+    @property
+    def token(self) -> Optional[str]:
+        """User access token alias. Never surfaces in model messages or directive props."""
+        return self.user_token
+
     def next_turn(self) -> int:
         """Increment and return the turn counter."""
         self.turn_counter += 1

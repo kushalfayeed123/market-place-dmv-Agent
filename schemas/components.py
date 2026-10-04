@@ -45,4 +45,4 @@ class UIDirective(BaseModel):
     version: int = 1
     component: ComponentName
     props: dict[str, Any] = Field(default_factory=dict)
-    correlation_id: str = Field(..., description="Correlation id tracing this directive back to a tool call")
+    correlation_id: str = Field(..., min_length=1, max_length=128, description="Correlation id tracing this directive back to a tool call")
