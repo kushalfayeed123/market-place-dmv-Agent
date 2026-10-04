@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 import redis.asyncio as redis
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -71,7 +72,8 @@ async def lifespan(app: FastAPI):
     config = app.state.config
     app.state.redis = _create_redis(config["redis_url"])
     app.state.redis_connected = False
-
+    
+  
     # Start background task to connect to Redis (don't block startup)
     redis_connected = asyncio.Event()
 
@@ -115,6 +117,26 @@ def create_app() -> FastAPI:
     config = _load_config()
     app = FastAPI(title="Marketplace Agent Gateway", version="0.1.0", lifespan=lifespan)
     app.state.config = config
+
+    # ── CORS ──────────────────────────────────────────────
+    # Allow the frontend dev origin (http://localhost:8443) and any origins
+    # listed in AGENT_CORS_ORIGINS (comma-separated). With
+    # allow_credentials=True the "*" wildcard is not permitted by the CORS
+    # spec, so origins are enumerated explicitly.
+    _cors_origins = [
+        origin.strip()
+        for origin in os.getenv(
+            "AGENT_CORS_ORIGINS", "http://localhost:8443,http://localhost:3000"
+        ).split(",")
+        if origin.strip()
+    ]
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
     def get_backend_client():
         if app.state.backend_client is None:
