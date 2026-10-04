@@ -33,33 +33,48 @@ def _map_variant(v: dict) -> VariantView:
 
 def _map_product_card(p: dict) -> ProductCardView:
     """Map a backend product list item to ProductCardView."""
+    _attrs = p.get("attributes") or {}
+    if not isinstance(_attrs, dict):
+        _attrs = {}
+    # Derive quantity_available from the first variant's inventory
+    _qty = None
+    _variants = p.get("variants") or []
+    if isinstance(_variants, list) and _variants:
+        _qty = _variants[0].get("quantity_available") if isinstance(_variants[0], dict) else None
     return ProductCardView(
         id=str(p.get("id", "")),
-        name=p.get("name", ""),
+        name=p.get("title", p.get("name", "")),
         merchant_id=str(p.get("merchant_id", "")),
-        merchant_name=p.get("merchant_name", ""),
+        merchant_name=p.get("merchant_name", p.get("store_name", "")),
         category_id=str(p.get("category_id", "") or ""),
         category_name=p.get("category_name"),
         price=_map_price(p.get("base_price_amount"), p.get("base_price_currency")),
-        image_url=p.get("image_url"),
-        quantity_available=p.get("quantity_available"),
+        image_url=p.get("image_url", _attrs.get("image_url")),
+        quantity_available=_qty if _qty is not None else p.get("quantity_available"),
         status=p.get("status", "active"),
     )
 
 
 def _map_product_detail(p: dict) -> ProductDetailView:
     """Map a backend product detail response to ProductDetailView."""
+    _attrs = p.get("attributes") or {}
+    if not isinstance(_attrs, dict):
+        _attrs = {}
     variants = [_map_variant(v) for v in (p.get("variants") or [])]
+    # Derive quantity_available from the first variant's inventory
+    _qty = None
+    if variants:
+        _qty = variants[0].quantity_available
     return ProductDetailView(
         id=str(p.get("id", "")),
-        name=p.get("name", ""),
+        name=p.get("title", p.get("name", "")),
         merchant_id=str(p.get("merchant_id", "")),
-        merchant_name=p.get("merchant_name", ""),
+        merchant_name=p.get("merchant_name", p.get("store_name", "")),
         category_id=str(p.get("category_id", "") or ""),
         category_name=p.get("category_name"),
         price=_map_price(p.get("base_price_amount"), p.get("base_price_currency")),
-        image_url=p.get("image_url"),
-        quantity_available=p.get("quantity_available"),
+        image_url=p.get("image_url", _attrs.get("image_url")),
+        quantity_available=_qty if _qty is not None else p.get("quantity_available"),
         status=p.get("status", "active"),
         description=p.get("description"),
         variants=variants,

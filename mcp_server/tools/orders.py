@@ -23,22 +23,24 @@ def _map_price(amount: float | None, currency: str | None) -> PriceView:
 
 def _map_order_item(i: dict) -> OrderItemView:
     return OrderItemView(
-        variant_id=str(i.get("variant_id", "")),
+        variant_id=str(i.get("variant_id", "") or i.get("id", "")),
         product_id=str(i.get("product_id", "")),
         product_name=i.get("product_name", ""),
         variant_name=i.get("variant_name", ""),
         sku=i.get("sku", ""),
         quantity=i.get("quantity", 0),
-        unit_price=_map_price(i.get("unit_price_amount"), i.get("unit_price_currency")),
-        line_total=_map_price(i.get("line_total_amount"), i.get("line_total_currency")),
+        # Backend OrderItemResponse uses flat `unit_price` (int minor) + `currency` (str)
+        unit_price=_map_price(i.get("unit_price"), i.get("currency")),
+        line_total=_map_price(i.get("line_total"), i.get("currency")),
     )
 
 
 def _map_order_summary(o: dict) -> OrderSummaryView:
     return OrderSummaryView(
         id=str(o.get("id", "")),
-        status=o.get("status", ""),
-        total=_map_price(o.get("total_amount"), o.get("total_currency")),
+        order_number=o.get("order_number", str(o.get("id", ""))),
+        status=str(o.get("status", "")),
+        total=_map_price(o.get("total_amount"), o.get("currency")),
         item_count=o.get("item_count", len(o.get("items", []))),
         created_at=o.get("created_at", ""),
         merchant_id=str(o.get("merchant_id", "")),
@@ -50,8 +52,9 @@ def _map_order_detail(o: dict) -> OrderDetailView:
     items = [_map_order_item(i) for i in o.get("items", [])]
     return OrderDetailView(
         id=str(o.get("id", "")),
-        status=o.get("status", ""),
-        total=_map_price(o.get("total_amount"), o.get("total_currency")),
+        order_number=o.get("order_number", str(o.get("id", ""))),
+        status=str(o.get("status", "")),
+        total=_map_price(o.get("total_amount"), o.get("currency")),
         item_count=o.get("item_count", len(items)),
         created_at=o.get("created_at", ""),
         merchant_id=str(o.get("merchant_id", "")),
@@ -139,7 +142,7 @@ def register_orders_tools(
         return CheckoutView(
             order_id=str(body.get("id", body.get("order_id", ""))),
             status=body.get("status", "pending"),
-            total=_map_price(body.get("total_amount"), body.get("total_currency")),
+            total=_map_price(body.get("total_amount"), body.get("currency")),
             item_count=body.get("item_count", cart.item_count),
             payment_required=body.get("payment_required", True),
             message=body.get("message", "Checkout initiated. Awaiting payment."),

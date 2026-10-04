@@ -16,8 +16,8 @@ from app.schemas.auth import (  # type: ignore[import-untyped]
     UserResponse,
     UserUpdate,
     TokenResponse,
-    LoginRequest,
-    RegisterRequest,
+    UserLogin as LoginRequest,
+    UserRegister as RegisterRequest,
     PasswordChange,
     PasswordResetConfirm,
 )
@@ -41,7 +41,8 @@ from app.schemas.orders import (  # type: ignore[import-untyped]
 
 # Payments
 from app.schemas.payments import (  # type: ignore[import-untyped]
-    PaymentTransactionResponse,
+    PaymentResponse as PaymentTransactionResponse,
+    PaymentResponse,
     RefundRequest,
     RefundResponse,
 )
@@ -56,6 +57,7 @@ from app.schemas.ledger import (  # type: ignore[import-untyped]
 from app.schemas.merchants import (  # type: ignore[import-untyped]
     MerchantResponse,
     MerchantCreate,
+    MerchantUpdate,
     MerchantPayoutAccountResponse,
     MerchantPayoutAccountCreate,
     MerchantPayoutAccountUpdate,
@@ -104,6 +106,7 @@ __all__ = [
     # Merchants
     "MerchantResponse",
     "MerchantCreate",
+    "MerchantUpdate",
     "MerchantPayoutAccountResponse",
     "MerchantPayoutAccountCreate",
     "MerchantPayoutAccountUpdate",

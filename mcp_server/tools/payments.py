@@ -91,6 +91,31 @@ def register_payments_tools(
         return _map_payment(body).model_dump()
 
     @server.tool(
+        name="list_payments",
+        description="List payments with optional filtering. Read-only.",
+    )
+    async def list_payments(
+        skip: int = 0,
+        limit: int = 50,
+        order_id: Optional[str] = None,
+        status: Optional[str] = None,
+        token: str | None = None,
+    ) -> list[dict]:
+        """List payments, optionally filtered by order ID or status."""
+        params: dict[str, Any] = {"skip": skip, "limit": limit}
+        if order_id:
+            params["order_id"] = order_id
+        if status:
+            params["status"] = status
+        body = await client.call(
+            "GET", "/payments/", token=token, params=params,
+        )
+        items = body.get("items", body) if isinstance(body, dict) else body
+        if not isinstance(items, list):
+            items = [items] if isinstance(items, dict) else []
+        return [_map_payment(p).model_dump() for p in items]
+
+    @server.tool(
         name="request_refund",
         description="Request a refund. HIGH risk — financial. Requires user confirmation.",
     )

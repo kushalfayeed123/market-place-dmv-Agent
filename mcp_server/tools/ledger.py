@@ -15,27 +15,45 @@ from schemas.ledger import BalanceView, LedgerEntryView
 
 
 def _map_balance(b: dict) -> BalanceView:
+    # Backend LedgerBalanceResponse uses `available_balance` and `held_balance`
+    # (minor-unit ints) plus a top-level `currency` and `calculated_at`.
+    currency = b.get("currency", "NGN")
     return BalanceView(
         merchant_id=str(b.get("merchant_id", "")),
         merchant_name=b.get("merchant_name", ""),
-        available=_map_price(b.get("available_amount"), b.get("currency")),
-        pending=_map_price(b.get("pending_amount"), b.get("currency")),
-        currency=b.get("currency", "NGN"),
-        updated_at=b.get("updated_at"),
+        available=_map_price(b.get("available_balance"), currency),
+        pending=_map_price(b.get("held_balance"), currency),
+        currency=currency,
+        updated_at=b.get("calculated_at", b.get("updated_at")),
     )
 
 
 def _map_ledger_entry(e: dict) -> LedgerEntryView:
+    # Backend LedgerEntryResponse: amount (int/minor), currency, entry_type,
+    # direction, created_at, metadata (dict), payment_transaction_id, order_id
+    currency = e.get("currency", "NGN")
+    # Derive a human-readable description from metadata or entry_type
+    desc = e.get("description")
+    if not desc:
+        md = e.get("metadata") or {}
+        if isinstance(md, dict):
+            desc = md.get("description") or md.get("reference") or md.get("note")
+    if not desc:
+        desc = e.get("entry_type", "ledger entry")
     return LedgerEntryView(
         id=str(e.get("id", "")),
-        entry_type=e.get("entry_type", ""),
-        amount=_map_price(e.get("amount"), e.get("currency")),
-        balance_after=_map_price(e.get("balance_after_amount"), e.get("currency"))
-        if e.get("balance_after_amount") is not None
+        entry_type=e.get("entry_type", e.get("type", "unknown")),
+        amount=_map_price(e.get("amount"), currency),
+        balance_after=_map_price(e.get("balance_after"), currency)
+        if e.get("balance_after") is not None
         else None,
-        order_id=str(e.get("order_id", "") or "") or None,
-        payment_id=str(e.get("payment_id", "") or "") or None,
-        description=e.get("description"),
+        order_id=(str(e.get("order_id", "") or "") or None) if e.get("order_id") else None,
+        payment_id=(str(e.get("payment_id", "") or "") or None)
+        if e.get("payment_id")
+        else (str(e.get("payment_transaction_id", "") or "") or None)
+        if e.get("payment_transaction_id")
+        else None,
+        description=desc,
         created_at=e.get("created_at", ""),
         entry_group_id=e.get("entry_group_id"),
     )

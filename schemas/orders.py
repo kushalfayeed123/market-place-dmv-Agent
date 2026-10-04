@@ -22,6 +22,7 @@ class OrderItemView(BaseModel):
 class OrderSummaryView(BaseModel):
     """A single row in OrderList."""
     id: str
+    order_number: str
     status: str
     total: PriceView
     item_count: int

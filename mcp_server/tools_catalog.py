@@ -166,6 +166,16 @@ GET_PAYMENT_STATUS = ToolMeta(
     description="Get payment status. Read-only.",
 )
 
+LIST_PAYMENTS = ToolMeta(
+    name="list_payments",
+    method="GET",
+    path="/payments/",
+    risk_tier=RiskTier.READ_ONLY,
+    requires_confirmation=False,
+    visible_to=ROLES,
+    description="List payments with optional filtering. Read-only.",
+)
+
 REQUEST_REFUND = ToolMeta(
     name="request_refund",
     method="POST",
@@ -370,6 +380,7 @@ ALL_TOOLS: tuple[ToolMeta, ...] = (
     LIST_ORDERS,
     PROCESS_PAYMENT,
     GET_PAYMENT_STATUS,
+    LIST_PAYMENTS,
     REQUEST_REFUND,
     GET_MERCHANT_BALANCE,
     GET_MERCHANT_LEDGER,
