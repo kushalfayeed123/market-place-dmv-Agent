@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import re
 import time
-
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Any, Optional
 
 from gateway.debug import DebugTracer
 from gateway.provider import ModelBackend
@@ -26,12 +26,23 @@ class Agent:
         model_backend: ModelBackend,
         debug_tracer: DebugTracer,
         system_prompt: str,
+        redis_client: Optional[Any] = None,
+        vector_namespace: str = "agent",
+        vector_store: Optional[Any] = None,
     ):
         self._client = backend_client
         self._gate = gate
         self._model = model_backend
         self._debug = debug_tracer
         self._system_prompt = system_prompt
+        # Redis-backed vector store for semantic_search (knowledge retrieval).
+        # Optional so the agent still functions — with an empty knowledge result
+        # — when Redis is unavailable or not wired (e.g. inside unit tests).
+        self._redis = redis_client
+        self._vector_namespace = vector_namespace
+        # When provided (e.g. by tests), `vector_store` is used directly instead
+        # of building one from `redis_client`.
+        self._vector_store = vector_store
 
     async def run_turn(
         self,
@@ -39,7 +50,16 @@ class Agent:
         user_message: str,
         confirmed_token: str | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
-        """Run a single turn of the agent loop."""
+        """Run a single turn of the agent loop.
+
+        Bounded, tool-aware loop: the model may emit tool calls, the agent
+        executes them and feeds the results back so the model can either deliver
+        its final answer or make further (combinations of) tool calls for the
+        same request — e.g. ``semantic_search`` -> ``get_product_detail``.
+        The loop stops when the model stops calling tools, when a tool requires
+        frontend confirmation (hand back via ``confirmed_token``), or when the
+        iteration cap is reached.
+        """
         turn_id = session.next_turn()
         session_id = session.session_id
         self._debug.log_turn_start(session_id, turn_id, user_message)
@@ -62,16 +82,69 @@ class Agent:
         from mcp_server.tools_catalog import tools_for_role
         available_tools = tools_for_role(session.role)
         tool_defs = [_tool_to_openai_format(t) for t in available_tools]
-        messages = [{"role": "user", "content": user_message}]
+        messages: list[dict[str, Any]] = [{"role": "user", "content": user_message}]
 
         self._debug.log_model_call(session_id, turn_id, self._model.provider_name, self._model.model_name)
 
         try:
-            async for event in self._model.stream(
-                messages=messages, tools=tool_defs, system_prompt=self._system_prompt,
-            ):
-                async for output in self._handle_event(event, session, turn_id, confirmed_token):
-                    yield output
+            max_iterations = 5
+            iteration = 0
+            while True:
+                iteration += 1
+                if iteration > max_iterations:
+                    self._debug.log_error(session_id, turn_id, "max_iterations", f"agent loop exceeded {max_iterations} iterations")
+                    yield {"type": "error", "error": "The assistant took too many steps and stopped."}
+                    return
+
+                # Tool calls emitted by the model during THIS stream, plus the
+                # executed results that get fed back as tool-role messages.
+                tool_calls_this_stream: list[dict[str, Any]] = []
+                tool_results: list[dict[str, Any]] = []
+
+                async for event in self._model.stream(
+                    messages=messages, tools=tool_defs, system_prompt=self._system_prompt,
+                ):
+                    async for output in self._handle_event(event, session, turn_id, confirmed_token, tool_results):
+                        yield output
+                    if event.get("type") == "tool_calls":
+                        tool_calls_this_stream.extend(event.get("tool_calls", []))
+                    elif event.get("type") == "tool_call":
+                        single = event.get("tool_call")
+                        if single:
+                            tool_calls_this_stream.append(single)
+
+                # A confirmation_required tool ends the turn; the frontend will
+                # re-invoke /sse with a confirmed_token rather than the agent loop.
+                if any(r.get("status") == "confirmation_required" for r in tool_results):
+                    return
+
+                # The model made tool calls: feed the results back and let it
+                # decide the next step (this is what enables tool combinations).
+                if tool_calls_this_stream and tool_results:
+                    messages.append({
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": tc.get("id", ""),
+                                "type": "function",
+                                "function": {
+                                    "name": tc.get("name", ""),
+                                    "arguments": json.dumps(tc.get("arguments", {})),
+                                },
+                            }
+                            for tc in tool_calls_this_stream
+                        ],
+                    })
+                    for r in tool_results:
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": r["tool_call_id"],
+                            "content": r["content"],
+                        })
+                    continue
+
+                return
         except Exception as e:
             self._debug.log_error(session_id, turn_id, "agent_error", str(e))
             yield {"type": "error", "error": f"Agent error: {e!s}"}
@@ -82,19 +155,33 @@ class Agent:
         session: Session,
         turn_id: int,
         confirmed_token: str | None,
+        tool_results: list[dict[str, Any]],
     ) -> AsyncIterator[dict[str, Any]]:
-        """Handle a single model event."""
+        """Handle a single model event.
+
+        ``tool_results`` accumulates the outcome of every tool call during this
+        stream so the agent loop can feed the results back to the model for the
+        next round (enabling combinations of tools per request).
+        """
         event_type = event.get("type")
         session_id = session.session_id
 
         if event_type == "delta":
             yield {"type": "text", "content": event.get("content", "")}
 
-        elif event_type == "tool_calls":
-            for tc in event.get("tool_calls", []):
+        elif event_type in ("tool_calls", "tool_call"):
+            if event_type == "tool_calls":
+                tool_list = event.get("tool_calls") or []
+            else:
+                single = event.get("tool_call")
+                tool_list = [single] if single else []
+            if isinstance(tool_list, dict):
+                tool_list = [tool_list]
+            for tc in tool_list or []:
                 tool_name = tc.get("name", "")
                 tool_args = tc.get("arguments", {})
-                self._debug.log_tool_selected(session_id, turn_id, tool_name, tool_args)
+                tool_call_id = tc.get("id", "")
+                self._debug.log_tool_selected(session_id, turn_id, tool_name, _summarize_args(tool_args))
 
                 from mcp_server.tools_catalog import is_mutating_financial
                 if is_mutating_financial(tool_name) and confirmed_token:
@@ -103,6 +190,7 @@ class Agent:
                 result = await self._execute_tool(tool_name, tool_args, session, turn_id)
 
                 if result.get("status") == "confirmation_required":
+                    self._debug.log_confirmation(session_id, turn_id, tool_name, True, False)
                     yield {
                         "type": "awaiting_confirmation",
                         "tool_name": tool_name,
@@ -116,9 +204,19 @@ class Agent:
                             correlation_id=session_id,
                         ).model_dump(),
                     }
+                    tool_results.append({
+                        "tool_call_id": tool_call_id,
+                        "status": "confirmation_required",
+                        "content": json.dumps({"status": "confirmation_required", "message": result.get("message", "")}),
+                    })
                 elif result.get("status") == "error":
                     self._debug.log_error(session_id, turn_id, result.get("error_kind", "tool_error"), result.get("message", "Unknown"))
                     yield {"type": "error", "error": result.get("message", "An error occurred.")}
+                    tool_results.append({
+                        "tool_call_id": tool_call_id,
+                        "status": "error",
+                        "content": json.dumps(_summarize_result(result)),
+                    })
                 else:
                     self._debug.log_tool_result(session_id, turn_id, tool_name, _summarize_result(result))
                     text_summary = _result_to_text(tool_name, result)
@@ -128,6 +226,15 @@ class Agent:
                     if directive:
                         self._debug.log_directive(session_id, turn_id, directive["component"], directive.get("props", {}))
                         yield {"type": "ui_directive", "directive": directive}
+                    tool_results.append({
+                        "tool_call_id": tool_call_id,
+                        "status": "success",
+                        "content": json.dumps({
+                            "status": "success",
+                            "tool_name": tool_name,
+                            "data": _strip_sensitive(result.get("data", {})),
+                        }),
+                    })
 
         elif event_type == "usage":
             self._debug.log_model_usage(session_id, turn_id, event.get("usage", {}))
@@ -138,7 +245,6 @@ class Agent:
         elif event_type == "error":
             self._debug.log_error(session_id, turn_id, "model_error", event.get("error", "Unknown"))
             yield {"type": "error", "error": event.get("error", "Model error")}
-
 
     async def _execute_tool(
         self, tool_name: str, args: dict[str, Any], session: Session, turn_id: int,
@@ -181,7 +287,7 @@ class Agent:
             if meta.method == "SESSION":
                 data = _exec_session_tool(tool_name, args, session)
             elif meta.method == "VECTOR":
-                data = await _exec_vector_tool(tool_name, args, session)
+                data = await self._exec_vector_tool(tool_name, args)
             else:
                 params, path_params, json_body = _build_call_args(meta, args, reserved)
                 body = await self._client.call(
@@ -201,6 +307,48 @@ class Agent:
 
         self._debug.log_backend_call(session.session_id, turn_id, meta.method, meta.path, None, (time.perf_counter() - start) * 1000)
         return {"status": "success", "tool_name": tool_name, "data": _strip_sensitive(data)}
+
+    async def _exec_vector_tool(self, tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
+        """Execute a VECTOR tool (currently only ``semantic_search``).
+
+        Backed by the Redis vector store when a Redis client or an injected
+        vector store is available; otherwise returns an empty result so the turn
+        degrades gracefully (no crash, no 500). The session token is never used
+        here, and results are stripped of sensitive keys before emission.
+        """
+        if tool_name != "semantic_search":
+            return {"items": []}
+        vector_store = self._vector_store
+        if vector_store is None and self._redis is not None:
+            from mcp_server.vector_store import TfidfEmbedder, VectorStore
+            vector_store = VectorStore(
+                redis_client=self._redis,
+                embedder=TfidfEmbedder(),
+                namespace=self._vector_namespace,
+            )
+        if vector_store is None:
+            return {"items": []}
+        query = args.get("query", "") or ""
+        top_k = args.get("top_k")
+        try:
+            top_k = int(top_k) if top_k is not None else 5
+        except (TypeError, ValueError):
+            top_k = 5
+        try:
+            results = await vector_store.search(query, top_k=max(1, min(top_k, 20)))
+        except Exception:
+            return {"items": []}
+        # VectorStore.search returns {id, text, metadata, score}; project to the
+        # MCP knowledge-tool shape ({text, score, metadata}) expected downstream.
+        items = [
+            {
+                "text": r.get("text", ""),
+                "score": r.get("score", 0.0),
+                "metadata": r.get("metadata", {}) or {},
+            }
+            for r in results
+        ]
+        return {"items": items}
 
     _INTENT_CLASSIFICATION_PROMPT = (
         "You are an intent classifier for a marketplace assistant. "
@@ -253,10 +401,20 @@ class Agent:
 
 
 def _tool_to_openai_format(tool_meta: Any) -> dict[str, Any]:
-    """Convert a ToolMeta to OpenAI function-calling format."""
+    """Convert a ToolMeta to OpenAI function-calling format.
+
+    Parameter schemas come from ``mcp_server.tools_catalog.parameters_for``,
+    which mirrors each tool's real signature (minus reserved auth keys), so the
+    model can populate arguments accurately rather than guessing.
+    """
+    from mcp_server.tools_catalog import parameters_for
     return {
         "type": "function",
-        "function": {"name": tool_meta.name, "description": tool_meta.description, "parameters": {"type": "object", "properties": {}}},
+        "function": {
+            "name": tool_meta.name,
+            "description": tool_meta.description,
+            "parameters": parameters_for(tool_meta.name),
+        },
     }
 
 
@@ -298,12 +456,13 @@ def _result_to_text(tool_name: str, result: dict[str, Any]) -> str | None:
         return "Here are the categories."
 
     if tool_name == "semantic_search":
-        if isinstance(data, list):
-            count = len(data)
-            if count == 0:
-                return "I couldn't find anything relevant in the knowledge base."
-            return f"Found {count} relevant result{'s' if count != 1 else ''} from the knowledge base."
-        return "Here's what I found."
+        items = data.get("items", data) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+    if isinstance(items, list):
+        count = len(items)
+        if count == 0:
+            return "I couldn't find anything relevant in the knowledge base."
+        return f"Found {count} relevant result{'s' if count != 1 else ''} from the knowledge base."
+    return "Here's what I found."
 
     if tool_name == "view_cart":
         items = data.get("items", []) if isinstance(data, dict) else []
@@ -440,11 +599,6 @@ _SENSITIVE_KEYS = {
     "token", "access_token", "user_token", "user_confirmed_token",
     "confirmed_token", "password", "secret", "card_number", "cvv",
 }
-
-
-async def _exec_vector_tool(tool_name: str, args: dict[str, Any], session: "Session") -> dict[str, Any]:
-    """Knowledge / vector tools (best-effort; the gateway agent has no Redis handle)."""
-    return {"items": []}
 
 
 def _strip_sensitive(data: Any) -> Any:

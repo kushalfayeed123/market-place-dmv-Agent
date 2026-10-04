@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from typing import Any
 
 
 class RiskTier(str, Enum):
@@ -410,4 +411,69 @@ def is_mutating_financial(tool_name: str) -> bool:
     """Whether the tool requires the confirmation gate."""
     meta = BY_NAME.get(tool_name)
     return meta.requires_confirmation if meta else False
+
+
+# ── Parameter schemas (mirror the MCP server's tool signatures) ─────────────
+# The gateway agent exposes these as the model's function-calling schemas so the
+# model can fill arguments accurately instead of guessing. Sensitive/reserved
+# keys (token, user_confirmed_token) are intentionally absent — they are injected
+# server-side by the agent and never sent to the model.
+TOOL_PARAMETERS: dict[str, dict[str, Any]] = {
+    "search_products": {
+        "type": "object",
+        "properties": {
+            "q": {"type": "string", "description": "Search keywords matched against product name, title, description, SKU, category, and merchant store name."},
+            "category_id": {"type": "string", "description": "Restrict results to a single category id."},
+            "merchant_id": {"type": "string", "description": "Restrict results to a single merchant/store."},
+            "price_min": {"type": "number", "description": "Lower price bound (inclusive), in the requested currency."},
+            "price_max": {"type": "number", "description": "Upper price bound (inclusive), in the requested currency."},
+            "currency": {"type": "string", "description": "ISO currency code, e.g. 'NGN' or 'USD'.", "default": "NGN"},
+            "skip": {"type": "integer", "description": "Pagination offset.", "default": 0},
+            "limit": {"type": "integer", "description": "Page size.", "default": 20},
+        },
+        "required": ["q"],
+    },
+    "get_product_detail": {
+        "type": "object",
+        "properties": {"product_id": {"type": "string", "description": "The product id to look up."}},
+        "required": ["product_id"],
+    },
+    "get_categories": {"type": "object", "properties": {}, "required": []},
+    "semantic_search": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Natural-language description of what the user is looking for (e.g. 'red leather wallet', 'laptop charger under $50')."},
+            "top_k": {"type": "integer", "description": "Maximum number of matches to return.", "default": 5},
+        },
+        "required": ["query"],
+    },
+    "get_user_profile": {"type": "object", "properties": {}, "required": []},
+    "view_cart": {"type": "object", "properties": {}, "required": []},
+    "add_to_cart": {
+        "type": "object",
+        "properties": {
+            "variant_id": {"type": "string", "description": "The product variant to add."},
+            "product_id": {"type": "string", "description": "The product id."},
+            "product_name": {"type": "string", "description": "Display name of the product."},
+            "variant_name": {"type": "string", "description": "Display name of the variant."},
+            "sku": {"type": "string", "description": "Stock-keeping unit of the variant."},
+            "quantity": {"type": "integer", "description": "Units to add.", "default": 1},
+            "unit_price_amount": {"type": "number", "description": "Unit price amount in minor units are not needed; pass the major-unit amount."},
+            "unit_price_currency": {"type": "string", "description": "ISO currency code.", "default": "NGN"},
+            "quantity_available": {"type": "integer", "description": "Units available for the variant.", "default": 0},
+        },
+        "required": ["variant_id"],
+    },
+    "remove_from_cart": {
+        "type": "object",
+        "properties": {"variant_id": {"type": "string", "description": "The variant id to remove from the cart."}},
+        "required": ["variant_id"],
+    },
+    "clear_cart": {"type": "object", "properties": {}, "required": []},
+}
+
+
+def parameters_for(tool_name: str) -> dict[str, Any]:
+    """Return the OpenAI parameter schema for a tool (empty object schema if unknown)."""
+    return TOOL_PARAMETERS.get(tool_name, {"type": "object", "properties": {}, "required": []})
 

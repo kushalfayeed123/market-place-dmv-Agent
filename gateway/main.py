@@ -198,6 +198,8 @@ def create_app() -> FastAPI:
                 model_backend=get_model_backend(),
                 debug_tracer=get_debug_tracer(),
                 system_prompt=system_prompt,
+                redis_client=app.state.redis,
+                vector_namespace=config["agent_namespace"],
             )
         return app.state.agent
 
