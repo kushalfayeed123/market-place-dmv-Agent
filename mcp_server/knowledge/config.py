@@ -34,7 +34,10 @@ def _float_env(env: dict[str, str], name: str, default: float) -> float:
 class KnowledgeConfig:
     """Configuration for the KB ingestion pipeline and query service."""
 
-    # Embedding provider: "nvidia" (production) | "tfidf" (dev/test fallback)
+    # Embedding provider: "nvidia" (production) | "fake" (local, no key needed)
+    # | "tfidf" (dev/test, requires a corpus fit). When "nvidia" is configured but
+    # no NVIDIA_API_KEY is set, load_knowledge_config silently falls back to
+    # "fake" below so the KB still embeds instead of returning 401 per call.
     embedding_provider: str = "nvidia"
     embedding_model: str = EMBEDDING_MODEL_NVIDIA
     embedding_dim: int = EMBEDDING_DIM_NVIDIA
@@ -77,6 +80,17 @@ def load_knowledge_config(env: dict[str, str] | None = None) -> KnowledgeConfig:
 
     provider = env.get("KB_EMBEDDING_PROVIDER", env.get("EMBEDDING_PROVIDER", "nvidia")).lower()
     model = env.get("KB_EMBEDDING_MODEL", EMBEDDING_MODEL_NVIDIA)
+    nvidia_api_key = env.get("NVIDIA_API_KEY", "")
+    # When the configured provider is NVIDIA but no API key is available, fall
+    # back to a local, key-free embedder. Without this each embed in the sync
+    # loop returns 401, zero product chunks are upserted, and semantic_search
+    # reads an empty index — so the agent reports "nothing found" because there
+    # is no embedded data to match. ``fake`` needs no fit and is identical at
+    # sync time and query time, keeping the versioned index consistent.
+    if provider == "nvidia" and not nvidia_api_key.strip():
+        provider = "fake"
+        if model == EMBEDDING_MODEL_NVIDIA:
+            model = "fake-hash-v1"
     # Dimension defaults to the pinned dim for the pinned NVIDIA model.
     default_dim = EMBEDDING_DIM_NVIDIA if provider == "nvidia" else 256
 
@@ -84,7 +98,7 @@ def load_knowledge_config(env: dict[str, str] | None = None) -> KnowledgeConfig:
         embedding_provider=provider,
         embedding_model=model,
         embedding_dim=_int_env(env, "KB_EMBEDDING_DIM", default_dim),
-        nvidia_api_key=env.get("NVIDIA_API_KEY", ""),
+        nvidia_api_key=nvidia_api_key,
         embedding_batch_size=_int_env(env, "KB_EMBEDDING_BATCH_SIZE", 64),
         embedding_timeout=_float_env(env, "KB_EMBEDDING_TIMEOUT", 60.0),
         redis_namespace=env.get("AGENT_REDIS_NAMESPACE", "agent"),

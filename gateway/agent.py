@@ -26,22 +26,26 @@ class Agent:
         model_backend: ModelBackend,
         debug_tracer: DebugTracer,
         system_prompt: str,
-        redis_client: Optional[Any] = None,
+                redis_client: Optional[Any] = None,
         vector_namespace: str = "agent",
         vector_store: Optional[Any] = None,
+        knowledge_service: Optional[Any] = None,
     ):
         self._client = backend_client
         self._gate = gate
         self._model = model_backend
         self._debug = debug_tracer
         self._system_prompt = system_prompt
-        # Redis-backed vector store for semantic_search (knowledge retrieval).
-        # Optional so the agent still functions — with an empty knowledge result
-        # — when Redis is unavailable or not wired (e.g. inside unit tests).
+                # Knowledge service — the intended RAG query path over the versioned
+        # Redis vector index (hybrid vector+lexical scoring + min_score threshold).
+        # When wired (the gateway does this), semantic_search reads the same index
+        # that the KB sync populates, so searches return real products instead of
+        # an empty result.
+        self._knowledge_service = knowledge_service
+        # Legacy fallback: a raw Redis client / injected vector store is used only
+        # when no KnowledgeService is configured (e.g. inside unit tests).
         self._redis = redis_client
         self._vector_namespace = vector_namespace
-        # When provided (e.g. by tests), `vector_store` is used directly instead
-        # of building one from `redis_client`.
         self._vector_store = vector_store
 
     async def run_turn(
@@ -314,7 +318,7 @@ class Agent:
             if meta.method == "SESSION":
                 data = _exec_session_tool(tool_name, args, session)
             elif meta.method == "VECTOR":
-                data = await self._exec_vector_tool(tool_name, args)
+                                data = await self._exec_vector_tool(tool_name, args)
             else:
                 params, path_params, json_body = _build_call_args(meta, args, reserved)
                 body = await self._client.call(
@@ -335,47 +339,78 @@ class Agent:
         self._debug.log_backend_call(session.session_id, turn_id, meta.method, meta.path, None, (time.perf_counter() - start) * 1000)
         return {"status": "success", "tool_name": tool_name, "data": _strip_sensitive(data)}
 
-    async def _exec_vector_tool(self, tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
+    async def _exec_vector_tool(
+        self, tool_name: str, args: dict[str, Any]
+    ) -> dict[str, Any]:
         """Execute a VECTOR tool (currently only ``semantic_search``).
 
-        Backed by the Redis vector store when a Redis client or an injected
-        vector store is available; otherwise returns an empty result so the turn
-        degrades gracefully (no crash, no 500). The session token is never used
-        here, and results are stripped of sensitive keys before emission.
+        Routes through the intended ``KnowledgeService`` — the versioned Redis
+        vector index with hybrid vector+lexical scoring and a min_score threshold
+        — when one is wired in (the gateway does this so searches hit the index
+        that the KB sync populates). Falls back to the legacy simple
+        ``VectorStore`` when no KnowledgeService is configured (e.g. inside the
+        smoke tests with an injected ``FakeVectorStore``).
+
+        Raw KB documents are returned in ``items`` (text/score/metadata) so the
+        model can cite them and then call ``get_product_detail`` for a specific
+        product. They are also surfaced as ``sources`` for citations. No backend
+        reads happen here, so ``get_product_detail`` remains the only route that
+        touches the catalog — keeping the search path free of N+1 fan-out.
+        Sensitive keys are stripped before return.
         """
         if tool_name != "semantic_search":
             return {"items": []}
-        vector_store = self._vector_store
-        if vector_store is None and self._redis is not None:
-            from mcp_server.vector_store import TfidfEmbedder, VectorStore
-            vector_store = VectorStore(
-                redis_client=self._redis,
-                embedder=TfidfEmbedder(),
-                namespace=self._vector_namespace,
-            )
-        if vector_store is None:
-            return {"items": []}
-        query = args.get("query", "") or ""
-        top_k = args.get("top_k")
+
+        query = (args.get("query", "") or "").strip()
         try:
-            top_k = int(top_k) if top_k is not None else 5
+            top_k = int(args.get("top_k") or 5)
         except (TypeError, ValueError):
             top_k = 5
-        try:
-            results = await vector_store.search(query, top_k=max(1, min(top_k, 20)))
-        except Exception:
-            return {"items": []}
-        # VectorStore.search returns {id, text, metadata, score}; project to the
-        # MCP knowledge-tool shape ({text, score, metadata}) expected downstream.
-        items = [
-            {
-                "text": r.get("text", ""),
-                "score": r.get("score", 0.0),
-                "metadata": r.get("metadata", {}) or {},
-            }
-            for r in results
-        ]
-        return {"items": items}
+        top_k = max(1, min(top_k, 20))
+
+        docs: list[dict[str, Any]] = []
+        if self._knowledge_service is not None:
+            kb = await self._knowledge_service.search(query, top_k=top_k)
+            if kb.status == "ok":
+                docs = [
+                    {
+                        "id": r.doc_id,
+                        "text": r.text,
+                        "score": r.score,
+                        "kind": r.kind or "",
+                        "topic": r.topic or "",
+                        "title": r.title or "",
+                        "metadata": r.metadata or {},
+                    }
+                    for r in kb.results
+                ]
+        elif self._vector_store is not None:
+            try:
+                docs = await self._vector_store.search(query, top_k=top_k)
+            except Exception:
+                docs = []
+        elif self._redis is not None:
+            try:
+                from mcp_server.vector_store import TfidfEmbedder, VectorStore
+
+                store = VectorStore(
+                    redis_client=self._redis,
+                    embedder=TfidfEmbedder(),
+                    namespace=self._vector_namespace,
+                )
+                docs = await store.search(query, top_k=top_k)
+            except Exception:
+                docs = []
+
+        if not docs:
+            return {"items": [], "query": query, "count": 0, "sources": []}
+
+        return {
+            "items": docs,
+            "query": query,
+            "count": len(docs),
+            "sources": [_kb_doc_to_source(d) for d in docs],
+        }
 
     _INTENT_CLASSIFICATION_PROMPT = (
         "You are an intent classifier for a marketplace assistant. "
@@ -424,7 +459,12 @@ class Agent:
         component = component_map.get(tool_name)
         if not component:
             return None
-        return UIDirective(component=component, props=_strip_sensitive(result.get("data", {})), correlation_id=session_id).model_dump()
+        props = _strip_sensitive(result.get("data", {}))
+        return UIDirective(
+            component=component,
+            props=props,
+            correlation_id=session_id,
+        ).model_dump()
 
 
 def _tool_to_openai_format(tool_meta: Any) -> dict[str, Any]:
@@ -452,6 +492,21 @@ def _summarize_args(args: dict[str, Any]) -> dict[str, Any]:
 
 def _summarize_result(result: dict[str, Any]) -> dict[str, Any]:
     return {"status": result.get("status"), "tool_name": result.get("tool_name"), "has_data": "data" in result}
+
+
+def _kb_doc_to_source(doc: dict[str, Any]) -> dict[str, Any]:
+    """Normalize a KB document (VectorStore / KBResult shape) into a citation
+    object the model can read and cite. Tolerant of missing fields."""
+    meta = doc.get("metadata") or {}
+    return {
+        "doc_id": doc.get("id", ""),
+        "title": doc.get("title", "") or meta.get("title", ""),
+        "text": doc.get("text", ""),
+        "score": float(doc.get("score", 0.0) or 0.0),
+        "kind": doc.get("kind", "") or meta.get("kind", "text"),
+        "topic": doc.get("topic", "") or meta.get("topic", ""),
+        "metadata": doc.get("metadata", {}) or {},
+    }
 
 
 def _result_to_text(tool_name: str, result: dict[str, Any]) -> str | None:
@@ -483,13 +538,16 @@ def _result_to_text(tool_name: str, result: dict[str, Any]) -> str | None:
         return "Here are the categories."
 
     if tool_name == "semantic_search":
-        items = data.get("items", data) if isinstance(data, dict) else (data if isinstance(data, list) else [])
-    if isinstance(items, list):
-        count = len(items)
-        if count == 0:
-            return "I couldn't find anything relevant in the knowledge base."
-        return f"Found {count} relevant result{'s' if count != 1 else ''} from the knowledge base."
-    return "Here's what I found."
+        if isinstance(data, dict):
+            items = data.get("items", data)
+        else:
+            items = data if isinstance(data, list) else []
+        if isinstance(items, list):
+            count = len(items)
+            if count == 0:
+                return "I couldn't find anything relevant in the knowledge base."
+            return f"Found {count} relevant result{'s' if count != 1 else ''} from the knowledge base."
+        return "Here's what I found."
 
     if tool_name == "view_cart":
         items = data.get("items", []) if isinstance(data, dict) else []

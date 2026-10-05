@@ -45,7 +45,9 @@ def _map_product_card(p: dict) -> ProductCardView:
         id=str(p.get("id", "")),
         name=p.get("title", p.get("name", "")),
         merchant_id=str(p.get("merchant_id", "")),
-        merchant_name=p.get("merchant_name", p.get("store_name", "")),
+        # Backend may send merchant_name/store_name as null; ProductCardView
+        # requires str, so coerce to "".
+        merchant_name=p.get("merchant_name") or p.get("store_name") or "",
         category_id=str(p.get("category_id", "") or ""),
         category_name=p.get("category_name"),
         price=_map_price(p.get("base_price_amount"), p.get("base_price_currency")),
@@ -69,7 +71,9 @@ def _map_product_detail(p: dict) -> ProductDetailView:
         id=str(p.get("id", "")),
         name=p.get("title", p.get("name", "")),
         merchant_id=str(p.get("merchant_id", "")),
-        merchant_name=p.get("merchant_name", p.get("store_name", "")),
+        # Backend may send merchant_name/store_name as null; the view requires
+        # str, so coerce to "".
+        merchant_name=p.get("merchant_name") or p.get("store_name") or "",
         category_id=str(p.get("category_id", "") or ""),
         category_name=p.get("category_name"),
         price=_map_price(p.get("base_price_amount"), p.get("base_price_currency")),

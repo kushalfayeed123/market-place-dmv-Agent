@@ -97,12 +97,51 @@ async def lifespan(app: FastAPI):
     # Start Redis connection in background
     redis_task = asyncio.create_task(_connect_redis())
 
+    # Background task: ingest the knowledge base on startup, then keep it fresh
+    # on a cron. This is the task that actually populates the versioned Redis
+    # vector index — without it, semantic_search reads an empty index and every
+    # product search returns nothing (the root cause of the original failure).
+    async def _kb_sync_loop():
+        from mcp_server.knowledge.config import load_knowledge_config
+        from mcp_server.knowledge.sync import run_sync
+
+        cfg = load_knowledge_config()
+        # Wait briefly so the Redis connection is established before syncing.
+        while not app.state.redis_connected:
+            try:
+                await asyncio.wait_for(app.state.redis.ping(), timeout=2)
+                app.state.redis_connected = True
+                break
+            except Exception:
+                await asyncio.sleep(1)
+        try:
+            while True:
+                try:
+                    await run_sync(app.state.redis, cfg, full=True)
+                except Exception as exc:
+                    print(f"[GATEWAY] KB sync error: {exc}")
+                await asyncio.sleep(cfg.sync_interval_seconds)
+        except asyncio.CancelledError:
+            return
+
+    app.state.kb_sync_task = asyncio.create_task(_kb_sync_loop())
+
     app.state.backend_client = None
     app.state.gate = None
     app.state.model_backend = None
     app.state.debug_tracer = None
     app.state.agent = None
+    app.state.knowledge_service = None
+    app.state.kb_sync_task = None
     yield
+
+    # Cancel the background KB sync (if running) and close Redis.
+    if app.state.kb_sync_task is not None:
+        app.state.kb_sync_task.cancel()
+        try:
+            await app.state.kb_sync_task
+        except (asyncio.CancelledError, Exception):
+            pass
     redis_task.cancel()
     try:
         await redis_task
@@ -191,6 +230,7 @@ def create_app() -> FastAPI:
     def get_agent():
         if app.state.agent is None:
             from .agent import Agent
+
             system_prompt = _load_system_prompt()
             app.state.agent = Agent(
                 backend_client=get_backend_client(),
@@ -200,8 +240,37 @@ def create_app() -> FastAPI:
                 system_prompt=system_prompt,
                 redis_client=app.state.redis,
                 vector_namespace=config["agent_namespace"],
+                knowledge_service=get_knowledge_service(),
             )
         return app.state.agent
+
+    def get_knowledge_service():
+        """Build the KnowledgeService lazily from the same Redis client,
+        versioned index namespace, and embedder used by the KB sync. Reusing the
+        shared ``KnowledgeConfig.index_namespace`` is what makes semantic_search
+        hit the index that the sync populates (the root cause of searches
+        returning empty when Redis/KnowledgeService was never wired in)."""
+        if app.state.knowledge_service is not None:
+            return app.state.knowledge_service
+        from mcp_server.knowledge.config import load_knowledge_config
+        from mcp_server.knowledge.embedders import create_embedder
+        from mcp_server.knowledge.service import KnowledgeService
+
+        kb_config = load_knowledge_config()
+        embedder = create_embedder(
+            provider=kb_config.embedding_provider,
+            api_key=kb_config.nvidia_api_key,
+            model=kb_config.embedding_model,
+            dim=kb_config.embedding_dim,
+            batch_size=kb_config.embedding_batch_size,
+            timeout=kb_config.embedding_timeout,
+        )
+        app.state.knowledge_service = KnowledgeService(
+            redis_client=app.state.redis,
+            embedder=embedder,
+            config=kb_config,
+        )
+        return app.state.knowledge_service
 
     def get_session_store():
         from .session import SessionStore
