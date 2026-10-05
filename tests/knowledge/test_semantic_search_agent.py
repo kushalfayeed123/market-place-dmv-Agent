@@ -16,7 +16,7 @@ from mcp_server.guards import ConfirmationGate
 from mcp_server.tools_catalog import parameters_for
 
 HERE = os.path.dirname(__file__)
-SYSTEM_PROMPT = open(os.path.join(HERE, "..", "prompts", "system.md"), encoding="utf-8").read()
+SYSTEM_PROMPT = open(os.path.join(HERE, "..", "..", "prompts", "system.md"), encoding="utf-8").read()
 
 
 class FakeModel:
@@ -98,28 +98,21 @@ async def test_natural_language_query_runs_semantic_search_then_detail():
     session = Session(session_id="smoke-1", role=None)
     events = [ev async for ev in agent.run_turn(session, "I'm looking for a red leather wallet")]
 
-    # Real schemas advertised (so the model can pick/call tools accurately).
     assert "query" in parameters_for("semantic_search")["properties"]
     assert parameters_for("semantic_search")["required"] == ["query"]
     assert "q" in parameters_for("search_products")["properties"]
-
-    # semantic_search actually fired against the vector store.
     assert vs.queries and "red leather wallet" in vs.queries[0]
-    # Combination of tools: the KB doc referenced a product id, so the model
-    # followed up with get_product_detail(product_id=...).
     assert backend.last_pp.get("product_id") == "prod-50"
     assert backend.calls == 1
-    # The agentic loop re-prompted after each tool result.
     assert model.calls == 3
-    assert "tool" in [m.get("role") for m in model.received[1]]  # KB result fed back
+    assert "tool" in [m.get("role") for m in model.received[1]]
 
     directives = [e["directive"] for e in events if e.get("type") == "ui_directive"]
     assert any(d["component"] == "ProductGrid" for d in directives)
     detail = next(d for d in directives if d["component"] == "ProductDetail")
     assert detail["props"]["name"] == "Red Leather Wallet"
     grid = next(d for d in directives if d["component"] == "ProductGrid")
-    assert grid["props"]["items"][0]["text"] == vs._items[0]["text"]  # untrusted data surfaced
-
+    assert grid["props"]["items"][0]["text"] == vs._items[0]["text"]
     blob = json.dumps(events).lower()
     assert "access_token" not in blob and "user_token" not in blob
 
@@ -131,4 +124,44 @@ async def test_semantic_search_without_vector_store_degrades_gracefully():
     session = Session(session_id="smoke-grace", role=None)
     events = [ev async for ev in agent.run_turn(session, "anything")]
     texts = [e.get("content") for e in events if e.get("type") == "text"]
-    assert any("anything relevant" in t for t in texts)  # empty KB -> friendly msg, no crash
+    assert any("anything relevant" in t for t in texts)
+
+
+async def test_handles_openai_nested_tool_call_format():
+    """Regression guard: the live NVIDIA backend emits OpenAI nested
+    {function:{name, arguments(str)}}; the agent must normalize that shape
+    (this was the '[None]' / 'Unknown tool' bug)."""
+    agent, vs, backend, model = _agent()
+    session = Session(session_id="smoke-openai", role=None)
+    args = json.dumps({"query": "red leather wallet", "top_k": 5})
+    event = {"type": "tool_calls", "tool_calls": [
+        {"id": "tc-x", "type": "function", "function": {"name": "semantic_search", "arguments": args}}
+    ]}
+    outputs = [o async for o in agent._handle_event(event, session, 1, None, [])]
+    assert vs.queries and "red leather wallet" in vs.queries[0]
+    dirs = [o["directive"] for o in outputs if o.get("type") == "ui_directive"]
+    assert any(d["component"] == "ProductGrid" for d in dirs)
+
+
+
+async def test_repeated_identical_tool_call_does_not_loop():
+    """Regression guard for the live 'too many steps' loop: re-proposing the SAME
+    tool call (identical name + args) must be skipped, so the turn terminates with
+    the already-fetched results instead of spinning against the iteration cap."""
+    agent, vs, backend, model = _agent()
+    dup = {"query": "phone case", "top_k": 5}
+    # Round 1: semantic_search + finish(tool_use). Round 2: the SAME semantic_search
+    # call again (a degenerate re-issue) with no finish -> must be deduped and skipped.
+    model._script = [
+        [{"type": "tool_calls", "tool_calls": [{"id": "a", "name": "semantic_search", "arguments": dup}]},
+         {"type": "finish", "reason": "tool_use"}],
+        [{"type": "tool_calls", "tool_calls": [{"id": "b", "name": "semantic_search", "arguments": dup}]}],
+    ]
+    session = Session(session_id="smoke-dedup", role=None)
+    events = [ev async for ev in agent.run_turn(session, "phone case")]
+    errors = [e for e in events if e.get("type") == "error"]
+    assert not any("too many steps" in str(e) for e in errors), "degenerate loop was not stopped"
+    assert vs.queries.count("phone case") == 1, "duplicate call was re-executed"
+    dirs = [e["directive"] for e in events if e.get("type") == "ui_directive"]
+    assert any(d["component"] == "ProductGrid" for d in dirs), "round-1 results were not returned to the UI"
+    assert model.calls == 2

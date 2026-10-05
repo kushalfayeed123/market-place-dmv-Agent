@@ -57,8 +57,9 @@ class Agent:
         its final answer or make further (combinations of) tool calls for the
         same request — e.g. ``semantic_search`` -> ``get_product_detail``.
         The loop stops when the model stops calling tools, when a tool requires
-        frontend confirmation (hand back via ``confirmed_token``), or when the
-        iteration cap is reached.
+        frontend confirmation (hand back via ``confirmed_token``), when the
+        model re-proposes an identical tool call (already executed, preventing
+        degenerate loops), or when the iteration cap is reached.
         """
         turn_id = session.next_turn()
         session_id = session.session_id
@@ -89,6 +90,7 @@ class Agent:
         try:
             max_iterations = 5
             iteration = 0
+            executed_signatures: set[str] = set()
             while True:
                 iteration += 1
                 if iteration > max_iterations:
@@ -104,7 +106,7 @@ class Agent:
                 async for event in self._model.stream(
                     messages=messages, tools=tool_defs, system_prompt=self._system_prompt,
                 ):
-                    async for output in self._handle_event(event, session, turn_id, confirmed_token, tool_results):
+                    async for output in self._handle_event(event, session, turn_id, confirmed_token, tool_results, executed_signatures):
                         yield output
                     if event.get("type") == "tool_calls":
                         tool_calls_this_stream.extend(event.get("tool_calls", []))
@@ -156,6 +158,7 @@ class Agent:
         turn_id: int,
         confirmed_token: str | None,
         tool_results: list[dict[str, Any]],
+        executed_signatures: set[str] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """Handle a single model event.
 
@@ -178,9 +181,33 @@ class Agent:
             if isinstance(tool_list, dict):
                 tool_list = [tool_list]
             for tc in tool_list or []:
-                tool_name = tc.get("name", "")
-                tool_args = tc.get("arguments", {})
-                tool_call_id = tc.get("id", "")
+                # Normalize both OpenAI-nested ({"function":{"name","arguments"}})
+                # and flat ({"name","arguments"}) tool-call shapes. ``arguments``
+                # may arrive as a JSON string (OpenAI) or a dict (spec/stubs).
+                fn = tc.get("function") if isinstance(tc, dict) else None
+                if isinstance(fn, dict):
+                    tool_name = fn.get("name", "")
+                    raw_args = fn.get("arguments", {})
+                    tool_call_id = tc.get("id", "")
+                else:
+                    tool_name = tc.get("name", "") if isinstance(tc, dict) else ""
+                    raw_args = tc.get("arguments", {}) if isinstance(tc, dict) else {}
+                    tool_call_id = tc.get("id", "") if isinstance(tc, dict) else ""
+                if isinstance(raw_args, str):
+                    try:
+                        tool_args = json.loads(raw_args)
+                    except json.JSONDecodeError:
+                        tool_args = {}
+                elif isinstance(raw_args, dict):
+                    tool_args = raw_args
+                else:
+                    tool_args = {}
+                sig = (tool_name, json.dumps(tool_args, sort_keys=True))
+                if executed_signatures is not None and sig in executed_signatures:
+                    self._debug.log("dedup.duplicate_tool_call", {"tool_name": tool_name, "args": _summarize_args(tool_args)}, session_id, turn_id)
+                    continue
+                if executed_signatures is not None:
+                    executed_signatures.add(sig)
                 self._debug.log_tool_selected(session_id, turn_id, tool_name, _summarize_args(tool_args))
 
                 from mcp_server.tools_catalog import is_mutating_financial

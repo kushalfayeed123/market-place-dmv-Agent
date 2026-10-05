@@ -246,9 +246,11 @@ class NvidiaBackend(ModelBackend):
                     async for event in _parse_sse(response, tools):
                         event_count += 1
                         if event.get("type") == "tool_calls":
-                            print(
-                                f"[NVIDIA] Stream yielded tool_calls event: {[tc.get('name') for tc in event.get('tool_calls', [])]}"
-                            )
+                            tc_names = [
+                                (tc.get('function') or {}).get('name') or tc.get('name')
+                                for tc in event.get('tool_calls', [])
+                            ]
+                            print(f"[NVIDIA] Stream yielded tool_calls event: {tc_names}")
                         yield event
                     print(f"[NVIDIA] Stream completed with {event_count} events")
                     return  # Success, exit retry loop
