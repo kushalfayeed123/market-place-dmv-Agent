@@ -53,7 +53,7 @@ class TestUntrustedContentHandling:
         """Product descriptions must be framed as data in the system prompt."""
         import os
         prompt_path = os.path.join(os.path.dirname(__file__), "..", "..", "prompts", "system.md")
-        with open(prompt_path, "r") as f:
+        with open(prompt_path, "r", encoding="utf-8") as f:
             prompt = f.read()
         assert "untrusted" in prompt.lower() or "data" in prompt.lower()
 

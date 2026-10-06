@@ -20,6 +20,7 @@ dependencies = [
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
+    "fakeredis>=2.39.0",
 ]
 
 [build-system]

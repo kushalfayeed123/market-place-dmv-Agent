@@ -7,17 +7,29 @@ This is server-side enforcement, not a prompt instruction.
 import pytest
 import pytest_asyncio
 import redis.asyncio as redis
+import fakeredis.aioredis as fakeredis
 
 from mcp_server.guards import ConfirmationGate, ConfirmationRequiredError
 
 
 @pytest_asyncio.fixture
 async def redis_client():
-    """Create a test Redis client."""
-    client = redis.from_url("redis://localhost:6379/15", decode_responses=True)
+    """Create a test Redis client.
+
+    Tries a real Redis at localhost:6379 first. If it is unavailable
+    (common in local / CI environments without Redis installed), falls
+    back to an in-memory fakeredis instance so the confirmation-gate
+    tests can still exercise the full ``store_token`` / ``consume_token``
+    flow.
+    """
+    try:
+        client = redis.from_url("redis://localhost:6379/15", decode_responses=True)
+        await client.ping()
+    except Exception:
+        client = fakeredis.FakeRedis(decode_responses=True)
     yield client
     await client.flushdb()
-    await client.close()
+    await client.aclose()
 
 
 @pytest_asyncio.fixture

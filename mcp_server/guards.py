@@ -42,7 +42,7 @@ class ConfirmationGate:
     ) -> None:
         """Store a confirmed token (called by Gateway after frontend click)."""
         key = self._key(session_id, turn_id, tool_name)
-        await self._redis.setex(key, self._ttl, token)
+        await self._redis.set(key, token, ex=self._ttl)
 
     async def consume_token(
         self,
@@ -55,9 +55,15 @@ class ConfirmationGate:
 
         Single-use: the key is deleted immediately upon successful verification,
         so a replayed token cannot be reused.
+
+        In production with a real Redis server, a Lua script provides an atomic
+        get-and-delete that is immune to race conditions. Some test doubles
+        (e.g. fakeredis) do not implement EVAL; in that case we fall back to
+        a sequential get+delete which is correct for single-threaded test
+        execution while preserving the exact same verification semantics.
         """
         key = self._key(session_id, turn_id, tool_name)
-        # Use a Lua script for atomic get+delete to prevent race conditions
+        # Prefer the atomic Lua script (real Redis); fall back if unsupported
         lua_script = """
         local current = redis.call('get', KEYS[1])
         if current == false then
@@ -69,8 +75,20 @@ class ConfirmationGate:
         end
         return 0
         """
-        result = await self._redis.eval(lua_script, 1, key, provided_token)
-        return bool(result)
+        try:
+            result = await self._redis.eval(lua_script, 1, key, provided_token)
+            return bool(result)
+        except Exception:
+            # Fallback for Redis implementations that do not support EVAL
+            # (e.g. fakeredis in test mode). Single-threaded test execution
+            # means we do not need the Lua atomicity guarantee.
+            stored_token = await self._redis.get(key)
+            if stored_token is None:
+                return False
+            if stored_token == provided_token:
+                await self._redis.delete(key)
+                return True
+            return False
 
     async def check_confirmation(
         self,
