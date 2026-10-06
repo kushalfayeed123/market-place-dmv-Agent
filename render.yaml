@@ -1,0 +1,18 @@
+# render.yaml for the AGENT repo. Place at the root of this repo,
+# next to Dockerfile, pyproject.toml and uv.lock.
+# Deploy via Render Dashboard -> New -> Blueprint -> select this repo.
+
+services:
+  - type: web
+    name: markto-agent
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    region: frankfurt            # keep the same region as the backend (closest to Amsterdam)
+    plan: starter                # free instances spin down when idle
+    healthCheckPath: /health
+    autoDeployTrigger: commit
+    envVars:
+      - key: BACKEND_URL         # e.g. https://marketplace-backend.onrender.com
+        sync: false
+      - key: OPENAI_API_KEY      # rename/replace with whichever LLM keys you use
+        sync: false

@@ -95,7 +95,7 @@ class Agent:
             max_iterations = 5
             iteration = 0
             executed_signatures: set[str] = set()
-            turn_summary_buffer: list[tuple[str, str, dict[str, Any]]] = []
+            turn_summary_buffer: list[tuple[str, str, dict[str, Any], bool]] = []
             while True:
                 iteration += 1
                 if iteration > max_iterations:
@@ -174,7 +174,7 @@ class Agent:
         confirmed_token: str | None,
         tool_results: list[dict[str, Any]],
         executed_signatures: set[str] | None = None,
-        summary_buffer: list[tuple[str, str, dict[str, Any]]] | None = None,
+        summary_buffer: list[tuple[str, str, dict[str, Any], bool]] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """Handle a single model event.
 
@@ -264,10 +264,15 @@ class Agent:
                     self._debug.log_tool_result(session_id, turn_id, tool_name, _summarize_result(result))
                     text_summary = _result_to_text(tool_name, result)
                     if text_summary:
-                        if summary_buffer is None:
+                        # Defer semantic_search miss summaries so they can be
+                        # suppressed if a later tool call returns product hits.
+                        # All other summaries are yielded immediately so text
+                        # always precedes the ui_directive it describes.
+                        is_deferred = summary_buffer is not None and _is_deferred_summary(tool_name, result)
+                        if summary_buffer is not None:
+                            summary_buffer.append((tool_name, text_summary, result, is_deferred))
+                        if not is_deferred:
                             yield {"type": "text", "content": text_summary}
-                        else:
-                            summary_buffer.append((tool_name, text_summary, result))
                     directive = self._result_to_directive(tool_name, result, session_id)
                     if directive:
                         self._debug.log_directive(session_id, turn_id, directive["component"], directive.get("props", {}))
@@ -305,6 +310,17 @@ class Agent:
 
         meta = BY_NAME.get(tool_name)
         if not meta:
+            _component_names = {c.value for c in ComponentName}
+            if tool_name in _component_names:
+                return {
+                    "status": "error",
+                    "tool_name": tool_name,
+                    "message": (
+                        f"\"{tool_name}\" is a UI component, not a tool. "
+                        f"Call a tool (e.g. search_products, get_product_detail) "
+                        f"and I will render the {tool_name} component automatically."
+                    ),
+                }
             return {"status": "error", "tool_name": tool_name, "message": f"Unknown tool: {tool_name}"}
 
         provided_token = args.get("user_confirmed_token")
@@ -631,25 +647,40 @@ def _result_has_items(result: dict[str, Any]) -> bool:
     return False
 
 
-def _flush_summaries(
-    summary_buffer: list[tuple[str, str, dict[str, Any]]],
-) -> list[str]:
-    """Emit buffered tool-result status text in order, suppressing a redundant
-    ``semantic_search`` "couldn't find any results" miss when a sibling search
-    already returned data this turn — so the transcript never shows a
-    contradictory "couldn't find … Found N products" pair.
+def _is_deferred_summary(tool_name: str, result: dict[str, Any]) -> bool:
+    """True if a tool-result text summary should be deferred to end-of-turn.
 
-    Buffering the summaries for the whole stream (rather than yielding each as
-    it is produced) is what lets us see every tool result before deciding
-    whether a miss summary should be dropped, regardless of call order.
+    ``semantic_search`` misses (empty KB results) are deferred because a later
+    ``search_products`` call in the same turn may surface results -- in which
+    case the "couldn't find any results" text is suppressed by
+    ``_flush_summaries``.  All other summaries are yielded immediately (before
+    their directive) to preserve correct transcript ordering.
+    """
+    return tool_name == "semantic_search" and not _result_has_items(result)
+
+
+def _flush_summaries(
+    summary_buffer: list[tuple[str, str, dict[str, Any], bool]],
+) -> list[str]:
+    """Emit *deferred* summaries, suppressing a redundant
+    ``semantic_search`` "couldn't find any results" miss when a sibling search
+    already returned data this turn -- so the transcript never shows a
+    contradictory "couldn't find ... Found N products" pair.
+
+    Only summaries flagged ``deferred=True`` are returned; summaries that were
+    already yielded immediately in ``_handle_event`` are skipped.  This lets us
+    have correct ordering (text before directive for most tools) while still
+    suppressing semantic_search miss text when a product hit exists.
     """
     search_tools = {"search_products", "semantic_search"}
     has_product_hit = any(
         tn in search_tools and _result_has_items(result)
-        for tn, _text, result in summary_buffer
+        for tn, _text, result, _deferred in summary_buffer
     )
     out: list[str] = []
-    for tool_name, text, result in summary_buffer:
+    for tool_name, text, result, deferred in summary_buffer:
+        if not deferred:
+            continue
         is_semantic_miss = (
             tool_name == "semantic_search" and not _result_has_items(result)
         )

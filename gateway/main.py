@@ -69,9 +69,9 @@ def _create_redis(url: str) -> redis.Redis:
 def _load_system_prompt() -> str:
     prompt_path = os.path.join(os.path.dirname(__file__), "..", "prompts", "system.md")
     try:
-        with open(prompt_path, "r") as f:
+        with open(prompt_path, "r", encoding="utf-8") as f:
             return f.read()
-    except FileNotFoundError:
+    except (FileNotFoundError, UnicodeDecodeError):
         return "You are a helpful marketplace assistant."
 
 
