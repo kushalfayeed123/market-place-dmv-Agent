@@ -81,9 +81,20 @@ async def _main(full: bool, test_query: str | None) -> int:
     load_dotenv()
     config = load_knowledge_config()
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    # Normalize Upstash-style https:// URLs to rediss:// and build the client
+    # exactly like the gateway does (gateway/main.py `_create_redis`): disable
+    # TLS verification for rediss:// so a rotated/expired Upstash server cert
+    # doesn't block the standalone sync CLI with CERTIFICATE_VERIFY_FAILED.
     if redis_url.startswith("https://"):
         redis_url = "rediss://" + redis_url[len("https://"):]
-    client = redis.from_url(redis_url, decode_responses=True)
+    elif redis_url.startswith("http://"):
+        redis_url = "redis://" + redis_url[len("http://"):]
+    elif not redis_url.startswith(("redis://", "rediss://", "unix://")):
+        redis_url = "redis://" + redis_url
+    redis_kwargs: dict[str, object] = {"decode_responses": True}
+    if redis_url.startswith("rediss://"):
+        redis_kwargs["ssl_cert_reqs"] = None
+    client = redis.from_url(redis_url, **redis_kwargs)
     try:
         await client.ping()
     except Exception as exc:  # noqa: BLE001

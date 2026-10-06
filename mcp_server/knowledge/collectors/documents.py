@@ -1,8 +1,8 @@
 """Collector for published knowledge documents (policies, FAQs, guides).
 
-Fetches ``GET /knowledge/documents`` from the backend — the admin-curated
-source of truth. Only published docs are exposed by that endpoint, so this
-collector never sees drafts.
+Fetches ``GET /knowledge/documents/published`` from the backend — the
+customer-facing, published-only endpoint (same trust level as the public
+catalog). It requires no auth, so the sync runs without a user token.
 """
 
 from __future__ import annotations
@@ -26,17 +26,26 @@ class DocumentsCollector:
         return "documents"
 
     def _fetch(self) -> list[dict]:
-        url = f"{self._base}{self._prefix}/knowledge/documents"
-        try:
-            with urllib.request.urlopen(url, timeout=self._timeout) as resp:
-                import json
+        import json
 
-                data = json.loads(resp.read().decode())
-        except Exception as exc:  # noqa: BLE001 — collector must never crash the sync
-            print(f"[kb-sync] documents source unavailable: {exc}")
-            return []
-        items = data.get("items", data) if isinstance(data, dict) else data
-        return [d for d in items if isinstance(d, dict)] if isinstance(items, list) else []
+        items: list[dict] = []
+        skip, limit = 0, 100  # backend caps limit at 200
+        while True:
+            url = f"{self._base}{self._prefix}/knowledge/published?skip={skip}&limit={limit}"
+            try:
+                with urllib.request.urlopen(url, timeout=self._timeout) as resp:
+                    page = json.loads(resp.read().decode())
+            except Exception as exc:  # noqa: BLE001
+                print(f"[kb-sync] documents source unavailable ({url}): {exc}")
+                break
+            if isinstance(page, dict):
+                page = page.get("items", [])
+            batch = [d for d in page if isinstance(d, dict)]
+            items.extend(batch)
+            if len(batch) < limit:
+                break
+            skip += limit
+        return items
 
     async def collect(self) -> AsyncIterator[SourceDocument]:
         import asyncio

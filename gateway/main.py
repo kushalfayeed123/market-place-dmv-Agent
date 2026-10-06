@@ -23,6 +23,14 @@ class SseRequest(BaseModel):
     message: str = Field(..., description="The user's message to the agent")
     session_id: str | None = Field(None, description="Existing session ID to resume a conversation. Creates new session if omitted.")
     confirmed_token: str | None = Field(None, description="Token from a prior user_confirmed directive, used to authorize a destructive action.")
+    user_token: str | None = Field(
+        None,
+        description=(
+            "The signed-in user's backend access token (Bearer), forwarded so "
+            "action intents are authenticated. Never trusted for role/tool "
+            "visibility — only to bypass the unauthenticated action gate."
+        ),
+    )
 
 
 def _load_config() -> dict:
@@ -294,14 +302,20 @@ def create_app() -> FastAPI:
         session_id = body.session_id
         message = body.message
         confirmed_token = body.confirmed_token
+        user_token = body.user_token
 
         sessions = get_session_store()
         if session_id:
             session = await sessions.get_session(session_id)
-            if not session:
-                session = await sessions.create_session()
+            if session is None:
+                session = await sessions.create_session(user_token=user_token)
+            elif user_token and not session.token:
+                # Resume an anonymous session with the caller's token so action
+                # intents (e.g. add_to_cart) are authenticated for a signed-in
+                # user whose session was created before they signed in.
+                session.user_token = user_token
         else:
-            session = await sessions.create_session()
+            session = await sessions.create_session(user_token=user_token)
 
         agent = get_agent()
 

@@ -95,11 +95,14 @@ class Agent:
             max_iterations = 5
             iteration = 0
             executed_signatures: set[str] = set()
+            turn_summary_buffer: list[tuple[str, str, dict[str, Any]]] = []
             while True:
                 iteration += 1
                 if iteration > max_iterations:
                     self._debug.log_error(session_id, turn_id, "max_iterations", f"agent loop exceeded {max_iterations} iterations")
                     yield {"type": "error", "error": "The assistant took too many steps and stopped."}
+                    for _summary in _flush_summaries(turn_summary_buffer):
+                        yield {"type": "text", "content": _summary}
                     return
 
                 # Tool calls emitted by the model during THIS stream, plus the
@@ -110,7 +113,10 @@ class Agent:
                 async for event in self._model.stream(
                     messages=messages, tools=tool_defs, system_prompt=self._system_prompt,
                 ):
-                    async for output in self._handle_event(event, session, turn_id, confirmed_token, tool_results, executed_signatures):
+                    async for output in self._handle_event(
+                        event, session, turn_id, confirmed_token,
+                        tool_results, executed_signatures, turn_summary_buffer,
+                    ):
                         yield output
                     if event.get("type") == "tool_calls":
                         tool_calls_this_stream.extend(event.get("tool_calls", []))
@@ -122,6 +128,8 @@ class Agent:
                 # A confirmation_required tool ends the turn; the frontend will
                 # re-invoke /sse with a confirmed_token rather than the agent loop.
                 if any(r.get("status") == "confirmation_required" for r in tool_results):
+                    for _summary in _flush_summaries(turn_summary_buffer):
+                        yield {"type": "text", "content": _summary}
                     return
 
                 # The model made tool calls: feed the results back and let it
@@ -150,7 +158,10 @@ class Agent:
                         })
                     continue
 
+                for _summary in _flush_summaries(turn_summary_buffer):
+                    yield {"type": "text", "content": _summary}
                 return
+
         except Exception as e:
             self._debug.log_error(session_id, turn_id, "agent_error", str(e))
             yield {"type": "error", "error": f"Agent error: {e!s}"}
@@ -163,6 +174,7 @@ class Agent:
         confirmed_token: str | None,
         tool_results: list[dict[str, Any]],
         executed_signatures: set[str] | None = None,
+        summary_buffer: list[tuple[str, str, dict[str, Any]]] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """Handle a single model event.
 
@@ -252,7 +264,10 @@ class Agent:
                     self._debug.log_tool_result(session_id, turn_id, tool_name, _summarize_result(result))
                     text_summary = _result_to_text(tool_name, result)
                     if text_summary:
-                        yield {"type": "text", "content": text_summary}
+                        if summary_buffer is None:
+                            yield {"type": "text", "content": text_summary}
+                        else:
+                            summary_buffer.append((tool_name, text_summary, result))
                     directive = self._result_to_directive(tool_name, result, session_id)
                     if directive:
                         self._debug.log_directive(session_id, turn_id, directive["component"], directive.get("props", {}))
@@ -540,13 +555,20 @@ def _result_to_text(tool_name: str, result: dict[str, Any]) -> str | None:
     if tool_name == "semantic_search":
         if isinstance(data, dict):
             items = data.get("items", data)
+            query = data.get("query", "")
         else:
             items = data if isinstance(data, list) else []
+            query = ""
         if isinstance(items, list):
             count = len(items)
             if count == 0:
-                return "I couldn't find anything relevant in the knowledge base."
-            return f"Found {count} relevant result{'s' if count != 1 else ''} from the knowledge base."
+                # Product-page searches route through semantic_search, so a miss
+                # is reported as "no results" — NOT as a "knowledge base" failure.
+                # Avoid branding a product query as a KB lookup, and let the turn
+                # fall back to category browsing instead of retrying unchanged.
+                return f"I couldn't find any results for '{query}'." if query else "I couldn't find any results."
+            noun = "result" if count == 1 else "results"
+            return f"Found {count} {noun}." if not query else f"Found {count} {noun} for '{query}'."
         return "Here's what I found."
 
     if tool_name == "view_cart":
@@ -594,6 +616,48 @@ def _result_to_text(tool_name: str, result: dict[str, Any]) -> str | None:
         return "Here's the fulfillment status."
 
     return None
+
+
+def _result_has_items(result: dict[str, Any]) -> bool:
+    """True if a tool result envelope carried a non-empty data payload."""
+    data = result.get("data") if isinstance(result, dict) else None
+    if isinstance(data, dict):
+        items = data.get("items")
+        if isinstance(items, list):
+            return len(items) > 0
+        return bool(data.get("count"))
+    if isinstance(data, list):
+        return len(data) > 0
+    return False
+
+
+def _flush_summaries(
+    summary_buffer: list[tuple[str, str, dict[str, Any]]],
+) -> list[str]:
+    """Emit buffered tool-result status text in order, suppressing a redundant
+    ``semantic_search`` "couldn't find any results" miss when a sibling search
+    already returned data this turn — so the transcript never shows a
+    contradictory "couldn't find … Found N products" pair.
+
+    Buffering the summaries for the whole stream (rather than yielding each as
+    it is produced) is what lets us see every tool result before deciding
+    whether a miss summary should be dropped, regardless of call order.
+    """
+    search_tools = {"search_products", "semantic_search"}
+    has_product_hit = any(
+        tn in search_tools and _result_has_items(result)
+        for tn, _text, result in summary_buffer
+    )
+    out: list[str] = []
+    for tool_name, text, result in summary_buffer:
+        is_semantic_miss = (
+            tool_name == "semantic_search" and not _result_has_items(result)
+        )
+        if is_semantic_miss and has_product_hit:
+            continue
+        out.append(text)
+    return out
+
 
 def _build_call_args(meta: Any, args: dict[str, Any], reserved: set[str]):
     """Split tool args into backend query params / path params / JSON body."""
