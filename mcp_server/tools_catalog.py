@@ -250,16 +250,6 @@ UPDATE_FULFILLMENT_STATUS = ToolMeta(
 )
 
 # ── Merchant tools ──────────────────────────────────────────────────────
-GET_ORDER_STATUS = ToolMeta(
-    name="get_order_status",
-    method="GET",
-    path="/orders/{order_id}",
-    risk_tier=RiskTier.READ_ONLY,
-    requires_confirmation=False,
-    visible_to=ROLES,
-    description="Get the status of an order. Read-only.",
-)
-
 LIST_ORDERS = ToolMeta(
     name="list_orders",
     method="GET",
@@ -323,6 +313,83 @@ UPDATE_INVENTORY = ToolMeta(
     description="Update inventory for a variant. Medium risk — mutating, non-financial.",
 )
 
+# ── Store tools ──
+GET_STORE_BY_MERCHANT = ToolMeta(
+    name="get_store_by_merchant",
+    method="GET",
+    path="/stores/merchant/{merchant_id}",
+    risk_tier=RiskTier.READ_ONLY,
+    requires_confirmation=False,
+    visible_to=frozenset({"merchant_owner", "merchant_staff", "platform_admin"} ),
+    description="Get the store for a merchant. Read-only, merchant-scoped.",
+)
+
+# ── Payout account tools ──
+GET_PAYOUT_ACCOUNTS = ToolMeta(
+    name="get_payout_accounts",
+    method="GET",
+    path="/merchants/{merchant_id}/payout-accounts",
+    risk_tier=RiskTier.READ_ONLY,
+    requires_confirmation=False,
+    visible_to=frozenset({"merchant_owner", "merchant_staff", "platform_admin"} ),
+    description="List payout accounts for a merchant. Read-only, merchant-scoped.",
+)
+
+CREATE_PAYOUT_ACCOUNT = ToolMeta(
+    name="create_payout_account",
+    method="POST",
+    path="/merchants/{merchant_id}/payout-accounts",
+    risk_tier=RiskTier.MEDIUM,
+    requires_confirmation=False,
+    visible_to=frozenset({"merchant_owner", "merchant_staff", "platform_admin"} ),
+    description="Create a payout account for a merchant. Medium risk - mutating, non-financial.",
+)
+
+
+# ── Payout account CRUD tools ──
+GET_PAYOUT_ACCOUNT = ToolMeta(
+    name="get_payout_account",
+    method="GET",
+    path="/merchants/{merchant_id}/payout-accounts/{payout_id}",
+    risk_tier=RiskTier.READ_ONLY,
+    requires_confirmation=False,
+    visible_to=frozenset({"merchant_owner", "merchant_staff", "platform_admin"} ),
+    description="Get a single payout account by id. Read-only, merchant-scoped.",
+)
+
+UPDATE_PAYOUT_ACCOUNT = ToolMeta(
+    name="update_payout_account",
+    method="PUT",
+    path="/merchants/{merchant_id}/payout-accounts/{payout_id}",
+    risk_tier=RiskTier.MEDIUM,
+    requires_confirmation=False,
+    visible_to=frozenset({"merchant_owner", "merchant_staff", "platform_admin"} ),
+    description="Update a payout account for a merchant. Medium risk - mutating, non-financial.",
+)
+
+DELETE_PAYOUT_ACCOUNT = ToolMeta(
+    name="delete_payout_account",
+    method="DELETE",
+    path="/merchants/{merchant_id}/payout-accounts/{payout_id}",
+    risk_tier=RiskTier.MEDIUM,
+    requires_confirmation=False,
+    visible_to=frozenset({"merchant_owner", "merchant_staff", "platform_admin"} ),
+    description="Delete (soft-delete) a payout account for a merchant. Medium risk - mutating, non-financial.",
+)
+
+
+# ── KYC status tools ──
+GET_MERCHANT_KYC_STATUS = ToolMeta(
+    name="get_merchant_kyc_status",
+    method="GET",
+    path="/merchants/{merchant_id}/kyc",
+    risk_tier=RiskTier.READ_ONLY,
+    requires_confirmation=False,
+    visible_to=frozenset({"merchant_owner", "merchant_staff", "platform_admin"}),
+    description="Get KYC status for a merchant. Read-only, merchant-scoped.",
+)
+
+
 # ── Admin tools ─────────────────────────────────────────────────────────
 REVIEW_KYC = ToolMeta(
     name="review_kyc",
@@ -344,26 +411,7 @@ REQUEST_PAYOUT = ToolMeta(
     description="Request a payout. HIGH risk — financial. Requires confirmation + MFA step-up.",
 )
 
-# ── Ledger tools ────────────────────────────────────────────────────────
-GET_MERCHANT_BALANCE = ToolMeta(
-    name="get_merchant_balance",
-    method="GET",
-    path="/merchants/{merchant_id}/balance",
-    risk_tier=RiskTier.READ_ONLY,
-    requires_confirmation=False,
-    visible_to=frozenset({"merchant_owner", "merchant_staff", "platform_admin"}),
-    description="Get merchant balance. Read-only, merchant-scoped.",
-)
 
-GET_MERCHANT_LEDGER = ToolMeta(
-    name="get_merchant_ledger",
-    method="GET",
-    path="/ledger/entries",
-    risk_tier=RiskTier.READ_ONLY,
-    requires_confirmation=False,
-    visible_to=frozenset({"merchant_owner", "merchant_staff", "platform_admin"}),
-    description="Get merchant ledger entries. Read-only, merchant-scoped.",
-)
 
 # ── Registry ─────────────────────────────────────────────────────────────
 ALL_TOOLS: tuple[ToolMeta, ...] = (
@@ -389,8 +437,16 @@ ALL_TOOLS: tuple[ToolMeta, ...] = (
     LIST_FULFILLMENTS,
     CREATE_FULFILLMENT,
     UPDATE_FULFILLMENT_STATUS,
+    GET_MERCHANT_ORDERS,
     GET_MERCHANT_PROFILE,
     LIST_MERCHANTS,
+    GET_STORE_BY_MERCHANT,
+    GET_PAYOUT_ACCOUNTS,
+    CREATE_PAYOUT_ACCOUNT,
+    GET_PAYOUT_ACCOUNT,
+    UPDATE_PAYOUT_ACCOUNT,
+    DELETE_PAYOUT_ACCOUNT,
+    GET_MERCHANT_KYC_STATUS,
     CREATE_PRODUCT,
     UPDATE_INVENTORY,
     REVIEW_KYC,
@@ -470,7 +526,204 @@ TOOL_PARAMETERS: dict[str, dict[str, Any]] = {
         "required": ["variant_id"],
     },
     "clear_cart": {"type": "object", "properties": {}, "required": []},
+    "initiate_checkout": {
+        "type": "object",
+        "properties": {
+            "items": {"type": "array", "description": "Cart items to checkout.", "items": {"type": "object"}},
+            "shipping_address": {"type": "object", "description": "Shipping address for physical goods."},
+        },
+        "required": ["items"],
+    },
+    "get_order_status": {
+        "type": "object",
+        "properties": {"order_id": {"type": "string", "description": "The order id to look up."}},
+        "required": ["order_id"],
+    },
+    "list_orders": {"type": "object", "properties": {}, "required": []},
+    "process_payment": {
+        "type": "object",
+        "properties": {
+            "order_id": {"type": "string", "description": "The order to pay for."},
+            "provider": {"type": "string", "description": "Payment provider, e.g. 'paystack'.", "default": "paystack"},
+        },
+        "required": ["order_id"],
+    },
+    "get_payment_status": {
+        "type": "object",
+        "properties": {"payment_id": {"type": "string", "description": "The payment id."}},
+        "required": ["payment_id"],
+    },
+    "list_payments": {"type": "object", "properties": {}, "required": []},
+    "request_refund": {
+        "type": "object",
+        "properties": {
+            "payment_id": {"type": "string", "description": "The payment to refund."},
+            "amount": {"type": "integer", "description": "Refund amount in minor units."},
+        },
+        "required": ["payment_id"],
+    },
+    "get_merchant_balance": {
+        "type": "object",
+        "properties": {"merchant_id": {"type": "string", "description": "The merchant id."}},
+        "required": ["merchant_id"],
+    },
+    "get_merchant_ledger": {
+        "type": "object",
+        "properties": {
+            "merchant_id": {"type": "string", "description": "The merchant id."},
+            "skip": {"type": "integer", "description": "Pagination offset.", "default": 0},
+            "limit": {"type": "integer", "description": "Page size.", "default": 100},
+        },
+        "required": ["merchant_id"],
+    },
+    "get_fulfillment_status": {
+        "type": "object",
+        "properties": {"order_id": {"type": "string", "description": "The order id."}},
+        "required": ["order_id"],
+    },
+    "list_fulfillments": {"type": "object", "properties": {}, "required": []},
+    "create_fulfillment": {
+        "type": "object",
+        "properties": {
+            "order_id": {"type": "string", "description": "The order to fulfill."},
+            "tracking_code": {"type": "string", "description": "Tracking code for the shipment."},
+            "courier": {"type": "string", "description": "Courier name."},
+        },
+        "required": ["order_id"],
+    },
+    "update_fulfillment_status": {
+        "type": "object",
+        "properties": {
+            "fulfillment_id": {"type": "string", "description": "The fulfillment id."},
+            "status": {"type": "string", "description": "New fulfillment status."},
+        },
+        "required": ["fulfillment_id", "status"],
+    },
+    "get_merchant_orders": {
+        "type": "object",
+        "properties": {"merchant_id": {"type": "string", "description": "The merchant id."}},
+        "required": ["merchant_id"],
+    },
+    "get_merchant_profile": {
+        "type": "object",
+        "properties": {"merchant_id": {"type": "string", "description": "The merchant id to look up."}},
+        "required": ["merchant_id"],
+    },
+    "list_merchants": {"type": "object", "properties": {}, "required": []},
+    "get_store_by_merchant": {
+        "type": "object",
+        "properties": {"merchant_id": {"type": "string", "description": "The merchant id."}},
+        "required": ["merchant_id"],
+    },
+    "get_payout_accounts": {
+        "type": "object",
+        "properties": {"merchant_id": {"type": "string", "description": "The merchant id."}},
+        "required": ["merchant_id"],
+    },
+    "create_payout_account": {
+        "type": "object",
+        "properties": {
+            "merchant_id": {"type": "string", "description": "The merchant id."},
+            "provider": {"type": "string", "description": "Payout provider name."},
+            "currency": {"type": "string", "description": "ISO currency code."},
+            "external_ref": {"type": "string", "description": "Provider-side reference."},
+            "account_last4": {"type": "string", "description": "Last 4 digits of bank account."},
+            "bank_name": {"type": "string", "description": "Bank name."},
+            "account_holder_name": {"type": "string", "description": "Account holder name."},
+            "bank_code": {"type": "string", "description": "Bank code."},
+            "routing_number": {"type": "string", "description": "Routing number."},
+            "account_type": {"type": "string", "description": "Account type."},
+            "country": {"type": "string", "description": "ISO 3166-1 alpha-2 country code."},
+            "is_active": {"type": "boolean", "description": "Whether the account is active."},
+        },
+        "required": ["merchant_id", "provider", "currency", "external_ref"],
+    },
+    "create_product": {
+        "type": "object",
+        "properties": {
+            "title": {"type": "string", "description": "Product title."},
+            "slug": {"type": "string", "description": "URL-safe slug."},
+            "description": {"type": "string", "description": "Product description."},
+            "fulfillment_type": {"type": "string", "description": "physical, digital, or service."},
+            "base_price_amount": {"type": "integer", "description": "Price in minor units (e.g. kobo)."},
+            "base_price_currency": {"type": "string", "description": "ISO currency code.", "default": "NGN"},
+            "category_id": {"type": "string", "description": "Category id."},
+            "merchant_id": {"type": "string", "description": "Merchant id (looked up if omitted)."},
+            "store_id": {"type": "string", "description": "Store id (looked up if omitted)."},
+            "urls": {"type": "array", "description": "Product image URLs.", "items": {"type": "string"}},
+            "status": {"type": "string", "description": "draft, active, or suspended."},
+        },
+        "required": ["title"],
+    },
+    "update_inventory": {
+        "type": "object",
+        "properties": {
+            "variant_id": {"type": "string", "description": "The product variant id."},
+            "quantity_available": {"type": "integer", "description": "New available quantity."},
+        },
+        "required": ["variant_id", "quantity_available"],
+    },
+    "review_kyc": {
+        "type": "object",
+        "properties": {
+            "merchant_id": {"type": "string", "description": "The merchant id."},
+            "kyc_status": {"type": "string", "description": "New KYC status: pending, test_mode, verified, or rejected."},
+            "reason": {"type": "string", "description": "Reason for the review."},
+        },
+        "required": ["merchant_id", "kyc_status"],
+    },
+    "request_payout": {
+        "type": "object",
+        "properties": {
+            "merchant_id": {"type": "string", "description": "The merchant id."},
+            "amount": {"type": "integer", "description": "Payout amount in minor units."},
+            "currency": {"type": "string", "description": "ISO currency code.", "default": "NGN"},
+        },
+        "required": ["merchant_id", "amount"],
+    },
+    "get_payout_account": {
+        "type": "object",
+        "properties": {
+            "merchant_id": {"type": "string", "description": "The merchant id."},
+            "payout_id": {"type": "string", "description": "The payout account id."},
+        },
+        "required": ["merchant_id", "payout_id"],
+    },
+    "update_payout_account": {
+        "type": "object",
+        "properties": {
+            "merchant_id": {"type": "string", "description": "The merchant id."},
+            "payout_id": {"type": "string", "description": "The payout account id."},
+            "provider": {"type": "string", "description": "Payout provider name."},
+            "currency": {"type": "string", "description": "ISO currency code."},
+            "external_ref": {"type": "string", "description": "Provider-side reference."},
+            "account_last4": {"type": "string", "description": "Last 4 digits of bank account."},
+            "bank_name": {"type": "string", "description": "Bank name."},
+            "account_holder_name": {"type": "string", "description": "Account holder name."},
+            "bank_code": {"type": "string", "description": "Bank code."},
+            "routing_number": {"type": "string", "description": "Routing number."},
+            "account_type": {"type": "string", "description": "Account type."},
+            "country": {"type": "string", "description": "ISO 3166-1 alpha-2 country code."},
+            "is_active": {"type": "boolean", "description": "Whether active."},
+        },
+        "required": ["merchant_id", "payout_id"],
+    },
+    "delete_payout_account": {
+        "type": "object",
+        "properties": {
+            "merchant_id": {"type": "string", "description": "The merchant id."},
+            "payout_id": {"type": "string", "description": "The payout account id."},
+        },
+        "required": ["merchant_id", "payout_id"],
+    },
+    "get_merchant_kyc_status": {
+        "type": "object",
+        "properties": {"merchant_id": {"type": "string", "description": "The merchant id."}},
+        "required": ["merchant_id"],
+    },
 }
+
+
 
 
 def parameters_for(tool_name: str) -> dict[str, Any]:
