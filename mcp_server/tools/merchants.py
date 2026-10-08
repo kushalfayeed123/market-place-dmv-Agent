@@ -47,25 +47,44 @@ def register_merchants_tools(server: Any, client: BackendClient, session: Any) -
         description="Create a new product. Medium risk — mutating, non-financial.",
     )
     async def create_product(
-        name: str,
-        description: str,
-        base_price_amount: float,
+        title: str,
+        description: Optional[str] = None,
+        base_price_amount: int = 0,
         base_price_currency: str = "NGN",
+        fulfillment_type: str = "physical",
         category_id: Optional[str] = None,
         merchant_id: Optional[str] = None,
+        store_id: Optional[str] = None,
+        slug: Optional[str] = None,
+        urls: Optional[list[str]] = None,
+        status: Optional[str] = None,
         token: Optional[str] = None,
     ) -> dict:
-        """Create a new product."""
+        """Create a new product.
+
+        ``merchant_id`` and ``store_id`` are optional — when omitted the backend
+        derives them from the authenticated user's merchant and primary store.
+        ``slug`` is auto-generated from ``title`` when not supplied.
+        """
         body_data: dict[str, Any] = {
-            "name": name,
+            "title": title,
             "description": description,
             "base_price_amount": base_price_amount,
             "base_price_currency": base_price_currency,
+            "fulfillment_type": fulfillment_type,
         }
         if category_id:
             body_data["category_id"] = category_id
         if merchant_id:
             body_data["merchant_id"] = merchant_id
+        if store_id:
+            body_data["store_id"] = store_id
+        if slug:
+            body_data["slug"] = slug
+        if urls:
+            body_data["urls"] = urls
+        if status:
+            body_data["status"] = status
 
         idempotency_key = derive_idempotency_key(
             session.user_id, session.current_turn_id, "create_product", body_data,
