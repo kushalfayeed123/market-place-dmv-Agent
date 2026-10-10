@@ -7,11 +7,8 @@ from typing import Any
 from mcp_server.backend_client import BackendClient, ToolError
 from mcp_server.guards import ConfirmationGate, ConfirmationRequiredError
 from mcp_server.idempotency import derive_idempotency_key
-from schemas.payments import PaymentView, PriceView, RefundView
-
-
-def _map_price(amount: float | None, currency: str | None) -> PriceView:
-    return PriceView(amount=float(amount or 0), currency=currency or "NGN")
+from mcp_server.utils.price import _map_price
+from schemas.payments import PaymentView, RefundView
 
 
 def _map_payment(p: dict) -> PaymentView:

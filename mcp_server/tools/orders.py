@@ -7,6 +7,7 @@ from typing import Any
 from mcp_server.backend_client import BackendClient, ToolError
 from mcp_server.guards import ConfirmationGate, ConfirmationRequiredError
 from mcp_server.idempotency import derive_idempotency_key
+from mcp_server.utils.price import _map_price
 from schemas.cart import CartLineItemView, CartView
 from schemas.orders import (
     CheckoutView,
@@ -15,10 +16,6 @@ from schemas.orders import (
     OrderSummaryView,
     PriceView,
 )
-
-
-def _map_price(amount: float | None, currency: str | None) -> PriceView:
-    return PriceView(amount=float(amount or 0), currency=currency or "NGN")
 
 
 def _map_order_item(i: dict) -> OrderItemView:
@@ -100,18 +97,15 @@ def register_orders_tools(
                 variant_name=i["variant_name"],
                 sku=i["sku"],
                 quantity=i["quantity"],
-                unit_price=PriceView(**i["unit_price"]),
-                line_total=PriceView(**i["line_total"]),
+                unit_price=_map_price(i["unit_price"].get("amount"), i["unit_price"].get("currency")),
+                line_total=_map_price(i["line_total"].get("amount"), i["line_total"].get("currency")),
                 quantity_available=i.get("quantity_available", 0),
             )
             for i in cart_raw.get("items", [])
         ]
         cart = CartView(
             items=items,
-            subtotal=PriceView(
-                amount=sum(i.line_total.amount for i in items),
-                currency=items[0].line_total.currency if items else "NGN",
-            ),
+            subtotal=_map_price(sum(i.line_total.amount for i in items), items[0].line_total.currency if items else "NGN"),
             item_count=sum(i.quantity for i in items),
             currency=items[0].line_total.currency if items else "NGN",
             is_empty=len(items) == 0,

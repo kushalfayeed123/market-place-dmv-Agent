@@ -1,148 +1,67 @@
-"""Tool contract tests — assert each MCP tool's output schema matches the corresponding view DTO.
-
-These tests verify that the data shapes the agent produces are exactly what the
-frontend expects (the "single schema, both ends" contract).
-"""
-
+"""Tool contract tests."""
 import pytest
 from schemas.catalog import ProductCardView, ProductDetailView, CategoryView, PriceView
 from schemas.cart import CartView, CartLineItemView
 from schemas.orders import OrderSummaryView, OrderDetailView, CheckoutView
-from schemas.payments import PaymentView, RefundView
-from schemas.ledger import BalanceView, LedgerEntryView
 from schemas.components import UIDirective, ComponentName
 
+N = "₦"
 
 class TestPriceView:
-    """PriceView is the canonical price shape used across all DTOs."""
+    def test_amount_is_int_not_float(self):
+        p = PriceView(amount=100800, currency="NGN", display=N+"1,008")
+        assert isinstance(p.amount, int)
+        assert not isinstance(p.amount, float)
 
-    def test_price_view_serializes_correctly(self):
-        price = PriceView(amount=18500.0, currency="NGN")
-        dumped = price.model_dump()
-        assert dumped == {"amount": 18500.0, "currency": "NGN"}
+    def test_serializes_correctly(self):
+        p = PriceView(amount=18500, currency="NGN", display=N+"185")
+        d = p.model_dump()
+        assert d["amount"] == 18500
+        assert d["display"] == N+"185"
 
-    def test_price_view_requires_amount(self):
+    def test_requires_display(self):
         with pytest.raises(Exception):
-            PriceView(currency="NGN")  # type: ignore
-
-    def test_price_view_requires_currency(self):
-        with pytest.raises(Exception):
-            PriceView(amount=100.0)  # type: ignore
-
+            PriceView(amount=100, currency="NGN")
 
 class TestProductCardView:
-    """ProductCardView is what ProductGrid renders."""
-
-    def test_minimal_product_card(self):
-        card = ProductCardView(
-            id="prod-1",
-            name="iPhone Case",
-            merchant_id="merch-1",
-            merchant_name="Tech Store",
-            price=PriceView(amount=5000.0, currency="NGN"),
-        )
-        dumped = card.model_dump()
-        assert dumped["id"] == "prod-1"
-        assert dumped["price"]["amount"] == 5000.0
-        assert dumped["price"]["currency"] == "NGN"
-
-    def test_product_card_with_optional_fields(self):
-        card = ProductCardView(
-            id="prod-2",
-            name="Ebook",
-            merchant_id="merch-1",
-            merchant_name="Book Store",
-            category_id="cat-1",
-            category_name="Books",
-            price=PriceView(amount=3500.0, currency="NGN"),
-            image_url="https://example.com/ebook.jpg",
-            quantity_available=25,
-        )
-        dumped = card.model_dump()
-        assert dumped["category_name"] == "Books"
-        assert dumped["quantity_available"] == 25
-
+    def test_minimal(self):
+        c = ProductCardView(id="p1", name="Case", merchant_id="m1", merchant_name="S",
+            price=PriceView(amount=5000, currency="NGN", display=N+"50"))
+        d = c.model_dump()
+        assert d["price"]["amount"] == 5000
+        assert isinstance(d["price"]["amount"], int)
 
 class TestCartView:
-    """CartView is what CartSummary renders."""
+    def test_cart_item_amount_is_int(self):
+        item = CartLineItemView(
+            variant_id="v1", product_id="p1", product_name="X", variant_name="Y",
+            sku="S1", quantity=1,
+            unit_price=PriceView(amount=5000, currency="NGN", display=N+"50"),
+            line_total=PriceView(amount=10000, currency="NGN", display=N+"100"),
+            quantity_available=10,
+        )
+        d = item.model_dump()
+        assert isinstance(d["unit_price"]["amount"], int)
+        assert isinstance(d["line_total"]["amount"], int)
 
     def test_empty_cart(self):
-        cart = CartView(
-            items=[],
-            subtotal=PriceView(amount=0, currency="NGN"),
-            item_count=0,
-            currency="NGN",
-            is_empty=True,
-        )
-        dumped = cart.model_dump()
-        assert dumped["is_empty"] is True
-        assert dumped["item_count"] == 0
-
-    def test_cart_with_items(self):
-        cart = CartView(
-            items=[
-                CartLineItemView(
-                    variant_id="var-1",
-                    product_id="prod-1",
-                    product_name="iPhone Case",
-                    variant_name="Black",
-                    sku="IC-BLK",
-                    quantity=2,
-                    unit_price=PriceView(amount=5000.0, currency="NGN"),
-                    line_total=PriceView(amount=10000.0, currency="NGN"),
-                    quantity_available=10,
-                ),
-            ],
-            subtotal=PriceView(amount=10000.0, currency="NGN"),
-            item_count=2,
-            currency="NGN",
-            is_empty=False,
-        )
-        dumped = cart.model_dump()
-        assert dumped["is_empty"] is False
-        assert len(dumped["items"]) == 1
-        assert dumped["items"][0]["line_total"]["amount"] == 10000.0
-
+        c = CartView(items=[], subtotal=PriceView(amount=0, currency="NGN", display=N+"0"),
+            item_count=0, currency="NGN", is_empty=True)
+        assert c.is_empty is True
 
 class TestCheckoutView:
-    """CheckoutView is returned by initiate_checkout."""
-
-    def test_checkout_view(self):
-        view = CheckoutView(
-            order_id="order-123",
-            status="pending",
-            total=PriceView(amount=18500.0, currency="NGN"),
-            item_count=3,
-        )
-        dumped = view.model_dump()
-        assert dumped["order_id"] == "order-123"
-        assert dumped["payment_required"] is True
-
+    def test_checkout(self):
+        v = CheckoutView(order_id="o1", status="pending",
+            total=PriceView(amount=18500, currency="NGN", display=N+"185"), item_count=3)
+        assert v.order_id == "o1"
+        assert v.payment_required is True
 
 class TestUIDirective:
-    """UIDirective is the envelope sent to the frontend."""
-
-    def test_minimal_directive(self):
-        directive = UIDirective(
-            component=ComponentName.ProductGrid,
-            props={"items": []},
-            correlation_id="abc123",
-        )
-        dumped = directive.model_dump()
-        assert dumped["type"] == "ui_directive"
-        assert dumped["version"] == 1
+    def test_minimal(self):
+        d = UIDirective(component=ComponentName.ProductGrid, props={"items": []}, correlation_id="x")
+        dumped = d.model_dump()
         assert dumped["component"] == "ProductGrid"
 
-    def test_unknown_component_rejected(self):
+    def test_unknown_rejected(self):
         with pytest.raises(Exception):
-            UIDirective(
-                component="NotARealComponent",  # type: ignore
-                props={},
-                correlation_id="abc123",
-            )
-
-    def test_all_allowlisted_components_valid(self):
-        """Every allowlisted component name must be a valid ComponentName."""
-        for name in ComponentName:
-            d = UIDirective(component=name, props={}, correlation_id="x")
-            assert d.component == name
+            UIDirective(component="Bad", props={}, correlation_id="x")

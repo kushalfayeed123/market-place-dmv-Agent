@@ -760,7 +760,7 @@ def _exec_session_tool(tool_name: str, args: dict[str, Any], session: "Session")
                 session.set_cart(cart)
                 return _build_cart_view(cart).model_dump()
         quantity = int(args.get("quantity", 1))
-        unit_amount = float(args.get("unit_price_amount", 0))
+        unit_amount = int(args.get("unit_price_amount", 0))
         currency = args.get("unit_price_currency", "NGN")
         cart["items"].append({
             "variant_id": variant_id, "product_id": args.get("product_id", ""),

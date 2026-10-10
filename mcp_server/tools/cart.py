@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from mcp_server.utils.price import _map_price
 from schemas.cart import CartLineItemView, CartView, PriceView
 
 
@@ -107,8 +108,8 @@ def _build_cart_view(cart: dict) -> CartView:
             variant_name=i["variant_name"],
             sku=i["sku"],
             quantity=i["quantity"],
-            unit_price=PriceView(**i["unit_price"]),
-            line_total=PriceView(**i["line_total"]),
+            unit_price=_map_price(i["unit_price"].get("amount"), i["unit_price"].get("currency")),
+            line_total=_map_price(i["line_total"].get("amount"), i["line_total"].get("currency")),
             quantity_available=i.get("quantity_available", 0),
         )
         for i in cart.get("items", [])
@@ -126,9 +127,9 @@ def _build_cart_view(cart: dict) -> CartView:
                 f"{i.product_name} ({i.variant_name}): only {i.quantity_available} available"
             )
 
-    return CartView(
+        return CartView(
         items=items,
-        subtotal=PriceView(amount=total_amount, currency=currency),
+        subtotal=_map_price(total_amount, currency),
         item_count=sum(i.quantity for i in items),
         currency=currency,
         is_empty=len(items) == 0,
