@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -75,6 +76,119 @@ def _load_system_prompt() -> str:
         return "You are a helpful marketplace assistant."
 
 
+# ---------------------------------------------------------------------------
+# SSE streaming helpers
+# ---------------------------------------------------------------------------
+
+_TURNTIMEOUT = 45       # seconds — cap on a single agent turn
+_HEARTBEAT = 15         # seconds — heartbeat comment while waiting on a slow tool/model
+
+
+def finalize_directives(directives: list[dict], has_text: bool) -> list[dict]:
+    """Clean up the directives collected during ONE agent turn before sending.
+
+    This mirrors the frontend's ``dedupeDirectives`` (agent-turn.ts) so the
+    gateway never emits redundant or contradictory directives:
+
+    - An empty ``ProductGrid`` is dropped (the agent's text already says
+      "no results");
+    - A ``ProductGrid`` whose *only* items are already covered by a
+      ``ProductDetail`` is dropped (the detail view replaces the card);
+    - A ``ProductCard`` whose product is in a ``ProductDetail`` is dropped;
+    - Identical directives collapse to one;
+    - Singleton views (CartSummary, OrderList, …) keep only the latest;
+    - If everything was dropped and the agent said nothing, one empty grid is
+      kept so the shopper still gets an empty state with suggestions.
+    """
+    def _ids(d: dict) -> list[str]:
+        p = d.get("props", {})
+        raw = p.get("items") or p.get("products") or []
+        return [str(i["id"]) for i in raw if isinstance(i, dict) and i.get("name")]
+
+    def _count(d: dict) -> int:
+        p = d.get("props", {})
+        raw = p.get("items") or p.get("products") or []
+        return len(raw) if isinstance(raw, list) else 0
+
+    detail_ids = {
+        str(d.get("props", {}).get("id"))
+        for d in directives
+        if d.get("component") == "ProductDetail"
+    }
+    out: list[dict] = []
+    seen: set[str] = set()
+    keep_last = {"CartSummary", "OrderList", "MerchantBalanceCard", "LedgerTable"}
+
+    for d in directives:
+        p = d.get("props", {})
+        if d["component"] == "ProductGrid":
+            if _count(d) == 0:
+                continue
+            ids = _ids(d)
+            if ids and all(i in detail_ids for i in ids):
+                continue
+        if d["component"] == "ProductCard":
+            pid = str(p.get("product", {}).get("id", ""))
+            if pid in detail_ids:
+                continue
+        key = d["component"] + ":" + json.dumps(p, sort_keys=True)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(d)
+
+    # Same product detail twice: keep the last one.
+    last_detail: dict[str, int] = {}
+    for i, d in enumerate(out):
+        if d["component"] == "ProductDetail":
+            pid = str(d.get("props", {}).get("id"))
+            last_detail[pid] = i
+    out = [
+        d for i, d in enumerate(out)
+        if d["component"] != "ProductDetail"
+        or last_detail.get(str(d.get("props", {}).get("id"))) == i
+    ]
+
+    for c in keep_last:
+        last = max(
+            (i for i, d in enumerate(out) if d["component"] == c),
+            default=-1,
+        )
+        out = [d for i, d in enumerate(out) if d["component"] != c or i == last]
+
+    if not out and not has_text:
+        empty = next((d for d in directives if d["component"] == "ProductGrid"), None)
+        if empty:
+            out.append(empty)
+    return out
+
+
+async def coalesce_text(
+    events: AsyncIterator[dict],
+    max_wait: float = 0.05,
+    min_chars: int = 24,
+) -> AsyncIterator[dict]:
+    """Batch text deltas so the client renders smoothly (~24 chars or 50 ms)."""
+    buf = ""
+    last = time.monotonic()
+    async for ev in events:
+        if ev.get("type") == "text":
+            buf += ev.get("content", "")
+            if len(buf) >= min_chars or time.monotonic() - last >= max_wait:
+                yield {"type": "text", "content": buf}
+                buf, last = "", time.monotonic()
+        else:
+            if buf:
+                yield {"type": "text", "content": buf}
+                buf, last = "", time.monotonic()
+            yield ev
+    if buf:
+        yield {"type": "text", "content": buf}
+
+
+
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     config = app.state.config
@@ -94,7 +208,7 @@ async def lifespan(app: FastAPI):
                 await app.state.redis.ping()
                 app.state.redis_connected = True
                 redis_connected.set()
-                print(f"[GATEWAY] Redis connected successfully")
+                print("[GATEWAY] Redis connected successfully")
                 return
             except Exception as exc:
                 app.state.redis_connected = False
@@ -221,7 +335,7 @@ def create_app() -> FastAPI:
 
             # Use FailoverBackend for NVIDIA to enable model switching
             if provider == "nvidia":
-                from .model_router import FailoverBackend, NIM_MODELS
+                from .model_router import NIM_MODELS, FailoverBackend
                 # Allow custom model list via env var, fallback to default NIM_MODELS
                 app.state.model_backend = FailoverBackend(
                     models=NIM_MODELS,
@@ -310,9 +424,6 @@ def create_app() -> FastAPI:
             if session is None:
                 session = await sessions.create_session(user_token=user_token)
             elif user_token and not session.token:
-                # Resume an anonymous session with the caller's token so action
-                # intents (e.g. add_to_cart) are authenticated for a signed-in
-                # user whose session was created before they signed in.
                 session.user_token = user_token
         else:
             session = await sessions.create_session(user_token=user_token)
@@ -320,15 +431,79 @@ def create_app() -> FastAPI:
         agent = get_agent()
 
         async def event_stream() -> AsyncIterator[str]:
-            yield f"event: session\ndata: {json.dumps({'session_id': session.session_id})}\n\n"
+            turn_id = session.current_turn_id + 1
+            yield (
+                "event: session\n"
+                f"data: {json.dumps({'session_id': session.session_id, 'turn_id': turn_id})}\n\n"
+            )
+            directives: list[dict] = []
+            has_text = False
+            text_buf = ""
+            text_last = time.monotonic()
             try:
-                async for event in agent.run_turn(session, message, confirmed_token):
-                    yield f"event: {event['type']}\ndata: {json.dumps(event)}\n\n"
+                agen = agent.run_turn(session, message, confirmed_token)
+                async with asyncio.timeout(_TURNTIMEOUT):
+                    while True:
+                        try:
+                            event = await asyncio.wait_for(anext(agen), timeout=_HEARTBEAT)
+                        except TimeoutError:
+                            if text_buf:
+                                ev = {"type": "text", "content": text_buf, "turn_id": turn_id}
+                                yield f"event: text\ndata: {json.dumps(ev)}\n\n"
+                                text_buf, text_last = "", time.monotonic()
+                            yield ": ping\n\n"
+                            continue
+                        except StopAsyncIteration:
+                            break
+                        event["turn_id"] = turn_id
+                        etype = event.get("type")
+                        if etype == "ui_directive":
+                            directives.append(event.get("directive"))
+                        elif etype == "text":
+                            has_text = True
+                            text_buf += event.get("content", "")
+                            if len(text_buf) >= 24 or time.monotonic() - text_last >= 0.05:
+                                ev = {"type": "text", "content": text_buf, "turn_id": turn_id}
+                                yield f"event: text\ndata: {json.dumps(ev)}\n\n"
+                                text_buf, text_last = "", time.monotonic()
+                        else:
+                            yield f"event: {etype}\ndata: {json.dumps(event)}\n\n"
+                if text_buf:
+                    ev = {"type": "text", "content": text_buf, "turn_id": turn_id}
+                    yield f"event: text\ndata: {json.dumps(ev)}\n\n"
+                finalized = finalize_directives(directives, has_text)
+                if not finalized and not has_text:
+                    yield (
+                        "event: text\n"
+                        f"data: {json.dumps({'content': "I couldn't find any results. Try a broader search.", 'turn_id': turn_id})}\n\n"
+                    )
+                for d in finalized:
+                    yield (
+                        "event: ui_directive\n"
+                        f"data: {json.dumps({'type': 'ui_directive', 'directive': d, 'turn_id': turn_id})}\n\n"
+                    )
                 await sessions.save_session(session)
+            except TimeoutError:
+                yield (
+                    "event: error\n"
+                    f"data: {json.dumps({'error': 'The agent took too long to respond. Please try again.', 'turn_id': turn_id})}\n\n"
+                )
             except Exception as e:
-                yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
+                yield (
+                    "event: error\n"
+                    f"data: {json.dumps({'error': str(e), 'turn_id': turn_id})}\n\n"
+                )
 
-        return StreamingResponse(event_stream(), media_type="text/event-stream")
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+                "Connection": "keep-alive",
+            },
+        )
+
 
     @app.get("/debug/sessions/{session_id}/trace")
     async def debug_trace(session_id: str):

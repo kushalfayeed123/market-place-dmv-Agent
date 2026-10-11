@@ -41,6 +41,11 @@ def _map_product_card(p: dict) -> ProductCardView:
     _variants = p.get("variants") or []
     if isinstance(_variants, list) and _variants:
         _qty = _variants[0].get("quantity_available") if isinstance(_variants[0], dict) else None
+    # Backend ProductResponse carries images under `urls`; fall back to urls[0]
+    # when image_url is absent so cards always render a primary image.
+    _urls = p.get("urls")
+    _urls = _urls if isinstance(_urls, list) else None
+    _image = p.get("image_url") or _attrs.get("image_url") or (_urls[0] if _urls else None)
     return ProductCardView(
         id=str(p.get("id", "")),
         name=p.get("title", p.get("name", "")),
@@ -51,7 +56,8 @@ def _map_product_card(p: dict) -> ProductCardView:
         category_id=str(p.get("category_id", "") or ""),
         category_name=p.get("category_name"),
         price=_map_price(p.get("base_price_amount"), p.get("base_price_currency")),
-        image_url=p.get("image_url", _attrs.get("image_url")),
+        image_url=_image,
+        urls=_urls,
         quantity_available=_qty if _qty is not None else p.get("quantity_available"),
         status=p.get("status", "active"),
     )
@@ -67,6 +73,11 @@ def _map_product_detail(p: dict) -> ProductDetailView:
     _qty = None
     if variants:
         _qty = variants[0].quantity_available
+    # Backend ProductResponse carries images under `urls`; fall back to urls[0]
+    # when image_url is absent so the detail page always renders a primary image.
+    _urls = p.get("urls")
+    _urls = _urls if isinstance(_urls, list) else None
+    _image = p.get("image_url") or _attrs.get("image_url") or (_urls[0] if _urls else None)
     return ProductDetailView(
         id=str(p.get("id", "")),
         name=p.get("title", p.get("name", "")),
@@ -77,7 +88,8 @@ def _map_product_detail(p: dict) -> ProductDetailView:
         category_id=str(p.get("category_id", "") or ""),
         category_name=p.get("category_name"),
         price=_map_price(p.get("base_price_amount"), p.get("base_price_currency")),
-        image_url=p.get("image_url", _attrs.get("image_url")),
+        image_url=_image,
+        urls=_urls,
         quantity_available=_qty if _qty is not None else p.get("quantity_available"),
         status=p.get("status", "active"),
         description=p.get("description"),

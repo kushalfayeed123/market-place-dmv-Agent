@@ -46,6 +46,7 @@ class ProductCardView(BaseModel):
     category_name: Optional[str] = None
     price: PriceView
     image_url: Optional[str] = None
+    urls: Optional[list[str]] = None  # product image URLs (primary first, then gallery)
     quantity_available: Optional[int] = None
     status: str = "active"
 

@@ -15,6 +15,85 @@ from mcp_server.backend_client import BackendClient
 from mcp_server.guards import ConfirmationGate
 from schemas.components import ComponentName, UIDirective
 
+# ── Keyword heuristics for anonymous-user auth gating ──────────────────────
+# The LLM intent classifier is the primary signal, but it can be unreliable
+# (e.g. misclassifying "search for shoes" as 'action' or "buy this" as 'info').
+# These keyword sets provide a safety net so that:
+#   1. Anonymous users can ALWAYS search / browse / manage their cart.
+#   2. Anonymous users are ALWAYS prompted to sign in for authenticated actions.
+# They are consulted ONLY when session.token is falsy (anonymous).
+
+# Queries that are always safe for anonymous users — product search, browsing,
+# general info, and cart operations (which are visible to the 'anonymous' role).
+_ANON_SAFE_QUERY_KEYWORDS = [
+    # Product / category search & information
+    "show me", "show", "find", "search", "browse", "looking for",
+    "what is", "what are", "what's", "whats", "how many", "how much",
+    "how to", "how do", "how can", "how should",
+    "price", "prices", "cost", "stock", "in stock", "available",
+    "rating", "ratings", "review", "reviews", "detail", "details",
+    "category", "categories", "info", "information", "describe",
+    "tell me", "can i", "is there", "do you have", "where is", "where are",
+    "product", "products", "catalog", "item", "items", "popular",
+    # Anonymous-safe cart operations
+    "add to cart", "add to my cart", "view cart", "see my cart",
+    "my cart", "clear cart", "empty cart", "remove from cart",
+    "delete from cart", "remove cart item", "delete cart item",
+]
+
+# Action keywords that require authentication — these map to tools that are
+# NOT visible to the 'anonymous' role (financial, order, admin, merchant).
+_AUTH_REQUIRED_KEYWORDS = [
+    # Financial / purchasing
+    "buy", "purchase", "checkout", "pay", "payment", "refund", "payout",
+    "withdraw", "transfer money",
+    # Orders (require auth — order data is user-scoped)
+    "order", "place an order", "place order",
+    "my order", "my orders", "order status", "order number", "order #",
+    "track my order",
+    # User profile / account
+    "my profile", "my account", "sign up", "register", "onboard",
+    # Admin / merchant actions
+    "approve", "reject", "kyc", "verify kyc", "review kyc",
+    "ship", "fulfill", "fulfillment", "create", "update", "delete",
+    "cancel", "ledger", "payout account",
+]
+
+
+def _is_anon_safe_query(message: str) -> bool:
+    """Return True if *message* is a search / browse / cart query that is
+    safe for anonymous users (no authentication required)."""
+    m = message.lower().strip()
+    return any(kw in m for kw in _ANON_SAFE_QUERY_KEYWORDS)
+
+
+def _requires_auth_action(message: str) -> bool:
+    """Return True if *message* requests an action that requires authentication
+    (i.e. a tool not visible to the 'anonymous' role).
+
+    Checked BEFORE :func:`_is_anon_safe_query` in the gate so that
+    user-scoped data requests and imperative actions always require sign-in.
+    Pure "how to" / "how do" questions are exempted via
+    :func:`_is_how_to_query`, which is checked first in the gate.
+    """
+    m = message.lower().strip()
+    return any(kw in m for kw in _AUTH_REQUIRED_KEYWORDS)
+
+
+def _is_how_to_query(message: str) -> bool:
+    """Return True for information-seeking questions like "how do I checkout?".
+
+    These are always treated as informational regardless of any auth
+    keyword they happen to contain.
+    """
+    m = message.lower().strip()
+    return any(m.startswith(w) for w in (
+        "how to", "how do", "how can", "how should",
+        "what is", "what are", "what's", "whats",
+        "can i", "is there", "do you have",
+        "tell me", "what", "how much", "how many",
+    ))
+
 
 class Agent:
     """The agent turn loop."""
@@ -71,6 +150,23 @@ class Agent:
 
         intent, confidence = await self._classify_intent(user_message, session)
         self._debug.log_intent(session_id, turn_id, intent, confidence)
+
+                # For anonymous users (no session token), supplement the LLM's intent
+        # classification with keyword heuristics so that:
+        #   1. "How to" / "what is" questions are ALWAYS allowed (informational).
+        #   2. Authenticated-action requests (buy, checkout, refund, …) ALWAYS
+        #      trigger a SignInPrompt (even if the model misclassifies them as
+        #      'info' and can't see the financial tools).
+        #   3. Search / browse / cart queries are NEVER blocked (even if the
+        #      model misclassifies them as 'action').
+        # Precedence: how-to → auth-required → anon-safe → model classification
+        if not session.token:
+            if _is_how_to_query(user_message):
+                intent = "info"
+            elif _requires_auth_action(user_message):
+                intent = "action"
+            elif _is_anon_safe_query(user_message):
+                intent = "info"
 
         if intent == "action" and not session.token:
             self._debug.log("auth.required", {"reason": "unauthenticated_action"}, session_id, turn_id)
@@ -550,7 +646,7 @@ def _result_to_text(tool_name: str, result: dict[str, Any]) -> str | None:
         items = data.get("items", data) if isinstance(data, dict) else data
         if isinstance(items, list):
             count = len(items)
-            query = data.get("q", "") if isinstance(data, dict) else ""
+            query = data.get("query", "") if isinstance(data, dict) else ""
             if query:
                 return f"Found {count} product{'s' if count != 1 else ''} matching '{query}'."
             return f"Found {count} product{'s' if count != 1 else ''}."
@@ -721,7 +817,9 @@ def _map_tool_result(tool_name: str, body: Any, args: dict[str, Any]) -> dict[st
         if not isinstance(items, list):
             items = [items] if isinstance(items, dict) else []
         result: dict[str, Any] = {"items": [_map_product_card(p).model_dump() for p in items]}
-        for key in ("q", "category_id", "merchant_id"):
+        if args.get("q"):
+            result["query"] = args["q"]
+        for key in ("category_id", "merchant_id"):
             if args.get(key):
                 result[key] = args[key]
         return result

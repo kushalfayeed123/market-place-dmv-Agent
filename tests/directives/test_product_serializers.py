@@ -1,11 +1,108 @@
-"""Tests for product_llm and product_ui serializers in backend/app/schemas/catalog.py.
+"""Tests for product image mapping in the agent tool mappers.
 
-These verify the money-correctness fix: the LLM-facing view must NOT contain
-raw amount integers (which would trigger the 100x bug).
+Verifies that `_map_product_card` and `_map_product_detail` correctly
+include the `urls` field and fall back to `urls[0]` for `image_url` when the
+backend does not provide a top-level `image_url`.
+
+Also tests that `product_llm` and `product_ui` serializers in
+backend/app/schemas/catalog.py maintain money-correctness.
 """
-
 import pytest
 from schemas.catalog import product_llm, product_ui
+from mcp_server.tools.catalog import _map_product_card, _map_product_detail
+
+
+class TestProductCardImageMapping:
+    def test_urls_passed_through(self):
+        p = {
+            "id": "prod-1", "title": "Widget", "merchant_id": "m-1",
+            "merchant_name": "Store", "base_price_amount": 5000,
+            "base_price_currency": "NGN", "status": "active",
+            "urls": ["https://img.example.com/a.jpg", "https://img.example.com/b.jpg"],
+        }
+        result = _map_product_card(p).model_dump()
+        assert result["urls"] == ["https://img.example.com/a.jpg", "https://img.example.com/b.jpg"]
+
+    def test_image_url_from_urls_when_no_image_url(self):
+        p = {
+            "id": "prod-1", "title": "Widget", "merchant_id": "m-1",
+            "merchant_name": "Store", "base_price_amount": 5000,
+            "base_price_currency": "NGN", "status": "active",
+            "urls": ["https://img.example.com/primary.jpg"],
+        }
+        result = _map_product_card(p).model_dump()
+        assert result["image_url"] == "https://img.example.com/primary.jpg"
+
+    def test_explicit_image_url_takes_precedence(self):
+        p = {
+            "id": "prod-1", "title": "Widget", "merchant_id": "m-1",
+            "merchant_name": "Store", "base_price_amount": 5000,
+            "base_price_currency": "NGN", "status": "active",
+            "image_url": "https://img.example.com/explicit.jpg",
+            "urls": ["https://img.example.com/primary.jpg"],
+        }
+        result = _map_product_card(p).model_dump()
+        assert result["image_url"] == "https://img.example.com/explicit.jpg"
+
+    def test_no_image_when_urls_absent(self):
+        p = {
+            "id": "prod-1", "title": "Widget", "merchant_id": "m-1",
+            "merchant_name": "Store", "base_price_amount": 5000,
+            "base_price_currency": "NGN", "status": "active",
+        }
+        result = _map_product_card(p).model_dump()
+        assert result["image_url"] is None
+        assert result["urls"] is None
+
+    def test_detail_includes_urls(self):
+        p = {
+            "id": "prod-1", "title": "Widget", "merchant_id": "m-1",
+            "merchant_name": "Store", "base_price_amount": 5000,
+            "base_price_currency": "NGN", "status": "active",
+            "urls": ["https://img.example.com/a.jpg", "https://img.example.com/b.jpg"],
+            "variants": [{"id": "v1", "sku": "SKU1", "name": "Default",
+                          "base_price_amount": 5000, "base_price_currency": "NGN",
+                          "quantity_available": 5, "attributes": {},
+                          "inventory_policy": "tracked"}],
+        }
+        result = _map_product_detail(p).model_dump()
+        assert result["urls"] == ["https://img.example.com/a.jpg", "https://img.example.com/b.jpg"]
+        assert result["image_url"] == "https://img.example.com/a.jpg"
+
+    def test_detail_explicit_image_url_takes_precedence(self):
+        p = {
+            "id": "prod-1", "title": "Widget", "merchant_id": "m-1",
+            "merchant_name": "Store", "base_price_amount": 5000,
+            "base_price_currency": "NGN", "status": "active",
+            "image_url": "https://img.example.com/explicit.jpg",
+            "urls": ["https://img.example.com/primary.jpg"],
+            "variants": [{"id": "v1", "sku": "SKU1", "name": "Default",
+                          "base_price_amount": 5000, "base_price_currency": "NGN",
+                          "quantity_available": 5, "attributes": {},
+                          "inventory_policy": "tracked"}],
+        }
+        result = _map_product_detail(p).model_dump()
+        assert result["image_url"] == "https://img.example.com/explicit.jpg"
+        assert result["urls"] == ["https://img.example.com/primary.jpg"]
+
+
+class TestProductSearchQueryProp:
+    """Verify that search_products results use 'query' (not 'q') for the frontend."""
+
+    def test_search_products_uses_query_key(self):
+        from gateway.agent import _map_tool_result
+
+        body = {"items": [
+            {"id": "p1", "title": "Widget", "merchant_id": "m1",
+             "merchant_name": "Store", "base_price_amount": 5000,
+             "base_price_currency": "NGN", "status": "active",
+             "urls": ["img.jpg"]},
+        ]}
+        args = {"q": "widget", "limit": 20}
+        result = _map_tool_result("search_products", body, args)
+        assert "query" in result
+        assert result["query"] == "widget"
+        assert "q" not in result
 
 
 class TestProductLLM:
