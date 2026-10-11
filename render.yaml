@@ -12,7 +12,13 @@ services:
     healthCheckPath: /health
     autoDeployTrigger: commit
     envVars:
-      - key: BACKEND_URL         # e.g. https://marketplace-backend.onrender.com
+      - key: BACKEND_API_URL     # e.g. https://marketplace-backend.onrender.com
         sync: false
-      - key: OPENAI_API_KEY      # rename/replace with whichever LLM keys you use
+      - key: NVIDIA_API_KEY
+        sync: false
+      - key: REDIS_URL           # e.g. rediss://... (Render Redis add-on)
+        sync: false
+      - key: AGENT_MODEL_PROVIDER
+        sync: false
+      - key: AGENT_CORS_ORIGINS
         sync: false

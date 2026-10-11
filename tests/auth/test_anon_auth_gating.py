@@ -8,7 +8,7 @@ import os
 
 import pytest
 
-from gateway.agent import Agent, _is_anon_safe_query, _requires_auth_action
+from gateway.agent import Agent, _is_anon_safe_query, _is_how_to_query, _requires_auth_action
 from gateway.debug import DebugTracer
 from gateway.session import Session
 from mcp_server.guards import ConfirmationGate
@@ -129,6 +129,26 @@ class TestRequiresAuthAction:
         assert _requires_auth_action("search for shoes") is False
         assert _requires_auth_action("what is the price") is False
         assert _requires_auth_action("add to cart") is False
+
+
+# -- How-to query detection tests --
+
+class TestHowToQueryDetection:
+    """Verify _is_how_to_query identifies process questions."""
+
+    def test_how_to_checkout_detected(self):
+        assert _is_how_to_query("how do I checkout") is True
+        assert _is_how_to_query("how to use this site") is True
+        assert _is_how_to_query("how can I return an item") is True
+
+    def test_what_is_order_status_not_how_to(self):
+        """'what is my order status' contains auth keyword 'order'
+        and must NOT be matched as a how-to query."""
+        assert _is_how_to_query("what is my order status") is False
+
+    def test_imperative_command_not_how_to(self):
+        assert _is_how_to_query("buy this phone") is False
+        assert _is_how_to_query("checkout please") is False
 
 
 # -- Agent-level auth gating tests --

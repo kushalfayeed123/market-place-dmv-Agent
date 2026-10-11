@@ -81,17 +81,20 @@ def _requires_auth_action(message: str) -> bool:
 
 
 def _is_how_to_query(message: str) -> bool:
-    """Return True for information-seeking questions like "how do I checkout?".
+    """Return True for process questions like "how do I checkout?" or
+    "how to track an order".
 
-    These are always treated as informational regardless of any auth
-    keyword they happen to contain.
+    These ask about *how the system works* and are always treated as
+    informational, even when they mention auth-sensitive words like
+    "checkout".  Questions that ask about *user-specific data* (e.g.
+    "what is my order status") are NOT matched here — they fall through
+    to :func:`_requires_auth_action`, which catches "order" and triggers
+    a sign-in prompt.
     """
     m = message.lower().strip()
     return any(m.startswith(w) for w in (
         "how to", "how do", "how can", "how should",
-        "what is", "what are", "what's", "whats",
-        "can i", "is there", "do you have",
-        "tell me", "what", "how much", "how many",
+        "how much", "how many",
     ))
 
 
@@ -151,9 +154,9 @@ class Agent:
         intent, confidence = await self._classify_intent(user_message, session)
         self._debug.log_intent(session_id, turn_id, intent, confidence)
 
-                # For anonymous users (no session token), supplement the LLM's intent
+        # For anonymous users (no session token), supplement the LLM's intent
         # classification with keyword heuristics so that:
-        #   1. "How to" / "what is" questions are ALWAYS allowed (informational).
+        #   1. Process questions ("how do I checkout?") are ALWAYS allowed.
         #   2. Authenticated-action requests (buy, checkout, refund, …) ALWAYS
         #      trigger a SignInPrompt (even if the model misclassifies them as
         #      'info' and can't see the financial tools).
