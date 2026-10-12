@@ -287,7 +287,7 @@ def create_app() -> FastAPI:
     _cors_origins = [
         origin.strip()
         for origin in os.getenv(
-            "AGENT_CORS_ORIGINS", "http://localhost:8443,http://localhost:3000"
+            "AGENT_CORS_ORIGINS", "http://localhost:8443,http://localhost:3000,https://market-place-dmv-fe.vercel.app"
         ).split(",")
         if origin.strip()
     ]
