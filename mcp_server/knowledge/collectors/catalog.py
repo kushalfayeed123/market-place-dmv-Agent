@@ -1,6 +1,11 @@
 """Collector for catalog data: products, categories (public endpoints).
 
 Product text is UNTRUSTED — scrubbed before entering the index.
+
+Product documents include rich searchable text: merchant name, category,
+description, variant names, and attribute values (color, size, material, etc.)
+so that natural-language queries like "red", "leather", or "cheap" can match
+products through any of these fields rather than only the product title.
 """
 
 from __future__ import annotations
@@ -10,6 +15,35 @@ import urllib.request
 from typing import AsyncIterator
 
 from .base import SourceDocument, scrub_untrusted
+
+
+def _enrich_product_text(p: dict) -> str:
+    """Build a rich searchable text from all product fields for KB indexing.
+
+    Includes merchant name, category, description, variant names, and variant
+    attributes (color, size, material, etc.) so that queries for attributes,
+    colors, or descriptors match products by their details — not just titles.
+    """
+    parts: list[str] = []
+    parts.append(str(p.get("title", p.get("name", ""))))
+    parts.append(str(p.get("merchant_name", p.get("store_name", ""))))
+    parts.append(str(p.get("category_name", p.get("category", ""))))
+    parts.append(str(p.get("description", "")))
+
+    attrs = p.get("attributes") or {}
+    if isinstance(attrs, dict):
+        for k, v in attrs.items():
+            parts.append(f"{k}: {v}")
+
+    for v in p.get("variants", []) or []:
+        if isinstance(v, dict):
+            parts.append(str(v.get("name", "")))
+            vattrs = v.get("attributes") or {}
+            if isinstance(vattrs, dict):
+                for k, vval in vattrs.items():
+                    parts.append(f"{k}: {vval}")
+
+    return " ".join(x for x in parts if x).strip()
 
 
 class CatalogCollector:
@@ -57,9 +91,8 @@ class CatalogCollector:
                 continue
             pid = str(p.get("id", p.get("product_id", "unknown")))
             cat = cat_names.get(str(p.get("category_id", "")), str(p.get("category", "")))
-            name = str(p.get("name", ""))
-            desc = scrub_untrusted(str(p.get("description", "")))
-            text = " ".join(x for x in [name, desc, cat] if x).strip()
+            name = str(p.get("title", p.get("name", "")))
+            text = scrub_untrusted(_enrich_product_text(p))
             if not text:
                 continue
             docs.append(SourceDocument(

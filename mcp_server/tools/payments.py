@@ -94,8 +94,8 @@ def register_payments_tools(
     async def list_payments(
         skip: int = 0,
         limit: int = 50,
-        order_id: Optional[str] = None,
-        status: Optional[str] = None,
+        order_id: str | None = None,
+        status: str | None = None,
         token: str | None = None,
     ) -> list[dict]:
         """List payments, optionally filtered by order ID or status."""

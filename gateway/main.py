@@ -1,43 +1,55 @@
-"""Agent Gateway — FastAPI app with SSE streaming and debug endpoints."""
+"""Agent Gateway: FastAPI app with SSE streaming, health checks and guarded debug endpoints."""
 
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
+import logging
 import os
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import Any
 
 import redis.asyncio as redis
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+# Re-exported for backwards compatibility (tests and other modules import them from here).
+from .streaming import coalesce_text, finalize_directives, sse, stream_turn  # noqa: F401
+from .tokens import normalize_token
+
 load_dotenv()
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger("gateway")
+
+_MERCHANT_ROLES = {"merchant_owner", "merchant_staff", "platform_admin"}
 
 
 class SseRequest(BaseModel):
     """Request body for the /sse endpoint."""
+
     message: str = Field(..., description="The user's message to the agent")
-    session_id: str | None = Field(None, description="Existing session ID to resume a conversation. Creates new session if omitted.")
-    confirmed_token: str | None = Field(None, description="Token from a prior user_confirmed directive, used to authorize a destructive action.")
+    session_id: str | None = Field(None, description="Existing session ID to resume a conversation.")
+    confirmed_token: str | None = Field(None, description="Token from a prior user_confirmed directive.")
     user_token: str | None = Field(
         None,
-        description=(
-            "The signed-in user's backend access token (Bearer), forwarded so "
-            "action intents are authenticated. Never trusted for role/tool "
-            "visibility — only to bypass the unauthenticated action gate."
-        ),
+        description="The signed-in user's backend access token. 'Bearer <token>' and '<token>' are both accepted.",
     )
 
 
+# ----------------------------------------------------------------------------- config
+
+
 def _load_config() -> dict:
-    """Load configuration from environment."""
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-    # Ensure Redis URL has proper scheme — handle http(s):// URLs from Upstash console
     if redis_url.startswith("https://"):
         redis_url = "rediss://" + redis_url[len("https://"):]
     elif redis_url.startswith("http://"):
@@ -53,15 +65,42 @@ def _load_config() -> dict:
         "model_name": os.getenv("AGENT_MODEL", "nvidia/llama-3.1-nemotron-70b-instruct"),
         "nvidia_api_key": os.getenv("NVIDIA_API_KEY", ""),
         "anthropic_api_key": os.getenv("ANTHROPIC_API_KEY", ""),
-        "debug_enabled": os.getenv("AGENT_DEBUG", "1") == "1",
+        # Debug endpoints are OFF unless AGENT_DEBUG=1, and then require X-Debug-Key.
+        "debug_enabled": os.getenv("AGENT_DEBUG", "0") == "1",
+        "debug_key": os.getenv("AGENT_DEBUG_KEY", ""),
         "gateway_host": os.getenv("AGENT_GATEWAY_HOST", "0.0.0.0"),
-        "gateway_port": int(os.getenv("AGENT_GATEWAY_PORT", "8001")),
+        "gateway_port": int(os.getenv("AGENT_GATEWAY_PORT", os.getenv("PORT", "8001"))),
         "confirmed_token_ttl": int(os.getenv("CONFIRMED_TOKEN_TTL", "300")),
+        "turn_timeout": float(os.getenv("AGENT_TURN_TIMEOUT", "100")),
+        "heartbeat": float(os.getenv("AGENT_HEARTBEAT", "15")),
+        "kb_sync_enabled": os.getenv("KB_SYNC_ENABLED", "1") == "1",
     }
 
 
+def _is_production() -> bool:
+    return bool(os.getenv("RENDER")) or os.getenv("ENV", "").lower() == "production"
+
+
+def validate_config(config: dict) -> None:
+    """Fail loudly at startup instead of silently searching an unreachable localhost."""
+    if not _is_production():
+        return
+    problems = []
+    backend = config["backend_api_url"]
+    if not os.getenv("BACKEND_API_URL") or "localhost" in backend or "127.0.0.1" in backend:
+        problems.append(f"BACKEND_API_URL is missing or points at localhost ({backend})")
+    if "localhost" in config["redis_url"] or "127.0.0.1" in config["redis_url"]:
+        problems.append("REDIS_URL points at localhost")
+    if config["model_provider"] == "nvidia" and not config["nvidia_api_key"]:
+        problems.append("NVIDIA_API_KEY is not set")
+    if config["debug_enabled"] and not config["debug_key"]:
+        problems.append("AGENT_DEBUG=1 requires AGENT_DEBUG_KEY")
+    if problems:
+        raise RuntimeError("Invalid production configuration: " + "; ".join(problems))
+
+
 def _create_redis(url: str) -> redis.Redis:
-    kwargs = {"decode_responses": True}
+    kwargs: dict[str, Any] = {"decode_responses": True}
     if url.startswith("rediss://"):
         kwargs["ssl_cert_reqs"] = None
     return redis.from_url(url, **kwargs)
@@ -70,230 +109,133 @@ def _create_redis(url: str) -> redis.Redis:
 def _load_system_prompt() -> str:
     prompt_path = os.path.join(os.path.dirname(__file__), "..", "prompts", "system.md")
     try:
-        with open(prompt_path, "r", encoding="utf-8") as f:
+        with open(prompt_path, encoding="utf-8") as f:
             return f.read()
     except (FileNotFoundError, UnicodeDecodeError):
+        logger.warning("system prompt not found at %s; using a minimal default", prompt_path)
         return "You are a helpful marketplace assistant."
 
 
-# ---------------------------------------------------------------------------
-# SSE streaming helpers
-# ---------------------------------------------------------------------------
-
-_TURNTIMEOUT = 45       # seconds — cap on a single agent turn
-_HEARTBEAT = 15         # seconds — heartbeat comment while waiting on a slow tool/model
+# ----------------------------------------------------------------------------- background tasks
 
 
-def finalize_directives(directives: list[dict], has_text: bool) -> list[dict]:
-    """Clean up the directives collected during ONE agent turn before sending.
-
-    This mirrors the frontend's ``dedupeDirectives`` (agent-turn.ts) so the
-    gateway never emits redundant or contradictory directives:
-
-    - An empty ``ProductGrid`` is dropped (the agent's text already says
-      "no results");
-    - A ``ProductGrid`` whose *only* items are already covered by a
-      ``ProductDetail`` is dropped (the detail view replaces the card);
-    - A ``ProductCard`` whose product is in a ``ProductDetail`` is dropped;
-    - Identical directives collapse to one;
-    - Singleton views (CartSummary, OrderList, …) keep only the latest;
-    - If everything was dropped and the agent said nothing, one empty grid is
-      kept so the shopper still gets an empty state with suggestions.
-    """
-    def _ids(d: dict) -> list[str]:
-        p = d.get("props", {})
-        raw = p.get("items") or p.get("products") or []
-        return [str(i["id"]) for i in raw if isinstance(i, dict) and i.get("name")]
-
-    def _count(d: dict) -> int:
-        p = d.get("props", {})
-        raw = p.get("items") or p.get("products") or []
-        return len(raw) if isinstance(raw, list) else 0
-
-    detail_ids = {
-        str(d.get("props", {}).get("id"))
-        for d in directives
-        if d.get("component") == "ProductDetail"
-    }
-    out: list[dict] = []
-    seen: set[str] = set()
-    keep_last = {"CartSummary", "OrderList", "MerchantBalanceCard", "LedgerTable"}
-
-    for d in directives:
-        p = d.get("props", {})
-        if d["component"] == "ProductGrid":
-            if _count(d) == 0:
-                continue
-            ids = _ids(d)
-            if ids and all(i in detail_ids for i in ids):
-                continue
-        if d["component"] == "ProductCard":
-            pid = str(p.get("product", {}).get("id", ""))
-            if pid in detail_ids:
-                continue
-        key = d["component"] + ":" + json.dumps(p, sort_keys=True)
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(d)
-
-    # Same product detail twice: keep the last one.
-    last_detail: dict[str, int] = {}
-    for i, d in enumerate(out):
-        if d["component"] == "ProductDetail":
-            pid = str(d.get("props", {}).get("id"))
-            last_detail[pid] = i
-    out = [
-        d for i, d in enumerate(out)
-        if d["component"] != "ProductDetail"
-        or last_detail.get(str(d.get("props", {}).get("id"))) == i
-    ]
-
-    for c in keep_last:
-        last = max(
-            (i for i, d in enumerate(out) if d["component"] == c),
-            default=-1,
-        )
-        out = [d for i, d in enumerate(out) if d["component"] != c or i == last]
-
-    if not out and not has_text:
-        empty = next((d for d in directives if d["component"] == "ProductGrid"), None)
-        if empty:
-            out.append(empty)
-    return out
+async def _connect_redis(app: FastAPI) -> None:
+    delay, max_delay = 1.0, 30.0
+    while True:
+        try:
+            await app.state.redis.ping()
+            app.state.redis_connected = True
+            logger.info("Redis connected")
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            app.state.redis_connected = False
+            logger.warning("Redis connection failed: %s. Retrying in %.0fs", exc, delay)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, max_delay)
 
 
-async def coalesce_text(
-    events: AsyncIterator[dict],
-    max_wait: float = 0.05,
-    min_chars: int = 24,
-) -> AsyncIterator[dict]:
-    """Batch text deltas so the client renders smoothly (~24 chars or 50 ms)."""
-    buf = ""
-    last = time.monotonic()
-    async for ev in events:
-        if ev.get("type") == "text":
-            buf += ev.get("content", "")
-            if len(buf) >= min_chars or time.monotonic() - last >= max_wait:
-                yield {"type": "text", "content": buf}
-                buf, last = "", time.monotonic()
-        else:
-            if buf:
-                yield {"type": "text", "content": buf}
-                buf, last = "", time.monotonic()
-            yield ev
-    if buf:
-        yield {"type": "text", "content": buf}
+async def _kb_sync_loop(app: FastAPI) -> None:
+    """Keep the knowledge index fresh: one full sync at startup, then incremental syncs."""
+    from mcp_server.knowledge.config import load_knowledge_config
+    from mcp_server.knowledge.sync import run_sync
+
+    status = app.state.kb_status
+    cfg = load_knowledge_config()
+    while not app.state.redis_connected:
+        await asyncio.sleep(1)
+    first = True
+    try:
+        while True:
+            started = time.monotonic()
+            try:
+                result = await run_sync(app.state.redis, cfg, full=first)
+                status.update(last_sync_at=time.time(), last_error=None, last_result=repr(result)[:200], mode="full" if first else "incremental")
+                logger.info("KB sync ok (%s) in %.1fs: %s", status["mode"], time.monotonic() - started, status["last_result"])
+                first = False
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                status["last_error"] = f"{type(exc).__name__}: {exc}"
+                logger.exception("KB sync failed")
+            status["runs"] += 1
+            await asyncio.sleep(cfg.sync_interval_seconds)
+    except asyncio.CancelledError:
+        return
 
 
-
+async def _self_test(app: FastAPI) -> None:
+    """Log, at startup, whether the backend is reachable and returns products."""
+    result: dict[str, Any] = {"status": "running"}
+    app.state.selftest = result
+    try:
+        client = app.state.get_backend_client()
+        health = await client.get_root("/health")
+        result["backend_health"] = health.status_code
+        body = await client.call("GET", "/catalog/products", params={"limit": 1})
+        items = body.get("items", body) if isinstance(body, dict) else body
+        result["catalog_items_returned"] = len(items) if isinstance(items, list) else -1
+        result["status"] = "ok"
+        logger.info("startup self-test ok: %s", result)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        result.update(status="failed", error=f"{type(exc).__name__}: {exc}")
+        logger.error("STARTUP SELF-TEST FAILED: the agent cannot reach the catalog (%s)", result["error"])
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     config = app.state.config
+    # Initialise ALL state before any task starts.
     app.state.redis = _create_redis(config["redis_url"])
     app.state.redis_connected = False
-    
-  
-    # Start background task to connect to Redis (don't block startup)
-    redis_connected = asyncio.Event()
-
-    async def _connect_redis():
-        """Background task to establish Redis connection with retries."""
-        retry_delay = 1.0
-        max_retry_delay = 30.0
-        while True:
-            try:
-                await app.state.redis.ping()
-                app.state.redis_connected = True
-                redis_connected.set()
-                print("[GATEWAY] Redis connected successfully")
-                return
-            except Exception as exc:
-                app.state.redis_connected = False
-                print(f"[GATEWAY] Redis connection failed: {exc}. Retrying in {retry_delay:.0f}s...")
-                await asyncio.sleep(retry_delay)
-                retry_delay = min(retry_delay * 2, max_retry_delay)
-
-    # Start Redis connection in background
-    redis_task = asyncio.create_task(_connect_redis())
-
-    # Background task: ingest the knowledge base on startup, then keep it fresh
-    # on a cron. This is the task that actually populates the versioned Redis
-    # vector index — without it, semantic_search reads an empty index and every
-    # product search returns nothing (the root cause of the original failure).
-    async def _kb_sync_loop():
-        from mcp_server.knowledge.config import load_knowledge_config
-        from mcp_server.knowledge.sync import run_sync
-
-        cfg = load_knowledge_config()
-        # Wait briefly so the Redis connection is established before syncing.
-        while not app.state.redis_connected:
-            try:
-                await asyncio.wait_for(app.state.redis.ping(), timeout=2)
-                app.state.redis_connected = True
-                break
-            except Exception:
-                await asyncio.sleep(1)
-        try:
-            while True:
-                try:
-                    await run_sync(app.state.redis, cfg, full=True)
-                except Exception as exc:
-                    print(f"[GATEWAY] KB sync error: {exc}")
-                await asyncio.sleep(cfg.sync_interval_seconds)
-        except asyncio.CancelledError:
-            return
-
-    app.state.kb_sync_task = asyncio.create_task(_kb_sync_loop())
-
     app.state.backend_client = None
     app.state.gate = None
     app.state.model_backend = None
     app.state.debug_tracer = None
     app.state.agent = None
     app.state.knowledge_service = None
-    app.state.kb_sync_task = None
+    app.state.kb_status = {"runs": 0, "last_sync_at": None, "last_error": None}
+    app.state.selftest = {"status": "pending"}
+
+    tasks = [asyncio.create_task(_connect_redis(app)), asyncio.create_task(_self_test(app))]
+    if config["kb_sync_enabled"]:
+        app.state.kb_sync_task = asyncio.create_task(_kb_sync_loop(app))
+        tasks.append(app.state.kb_sync_task)
     yield
 
-    # Cancel the background KB sync (if running) and close Redis.
-    if app.state.kb_sync_task is not None:
-        app.state.kb_sync_task.cancel()
-        try:
-            await app.state.kb_sync_task
-        except (asyncio.CancelledError, Exception):
-            pass
-    redis_task.cancel()
-    try:
-        await redis_task
-    except asyncio.CancelledError:
-        pass
-    await app.state.redis.close()
+    for t in tasks:
+        t.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    if app.state.backend_client is not None:
+        await app.state.backend_client.close()
+    closer = getattr(app.state.redis, "aclose", None) or app.state.redis.close
+    await closer()
 
+
+# ----------------------------------------------------------------------------- app
 
 
 def create_app() -> FastAPI:
-    """Create the FastAPI application."""
     config = _load_config()
-    app = FastAPI(title="Marketplace Agent Gateway", version="0.1.0", lifespan=lifespan)
+    validate_config(config)
+    app = FastAPI(title="Marketplace Agent Gateway", version="0.2.0", lifespan=lifespan)
     app.state.config = config
 
-    # ── CORS ──────────────────────────────────────────────
-    # Allow the frontend dev origin (http://localhost:8443) and any origins
-    # listed in AGENT_CORS_ORIGINS (comma-separated). With
-    # allow_credentials=True the "*" wildcard is not permitted by the CORS
-    # spec, so origins are enumerated explicitly.
-    _cors_origins = [
-        origin.strip()
-        for origin in os.getenv(
-            "AGENT_CORS_ORIGINS", "http://localhost:8443,http://localhost:3000,https://market-place-dmv-fe.vercel.app"
+    origins = [
+        o.strip()
+        for o in os.getenv(
+            "AGENT_CORS_ORIGINS",
+            "http://localhost:8443,http://localhost:3000,https://market-place-dmv-fe.vercel.app",
         ).split(",")
-        if origin.strip()
+        if o.strip()
     ]
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=_cors_origins,
+        allow_origins=origins,
+        allow_origin_regex=os.getenv("AGENT_CORS_ORIGIN_REGEX") or None,  # e.g. https://.*\.vercel\.app for previews
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -302,29 +244,29 @@ def create_app() -> FastAPI:
     def get_backend_client():
         if app.state.backend_client is None:
             from mcp_server.backend_client import BackendClient
+
             app.state.backend_client = BackendClient(
-                base_url=config["backend_api_url"],
-                api_prefix=config["backend_api_prefix"],
+                base_url=config["backend_api_url"], api_prefix=config["backend_api_prefix"]
             )
         return app.state.backend_client
+
+    app.state.get_backend_client = get_backend_client
 
     def get_gate():
         if app.state.gate is None:
             from mcp_server.guards import ConfirmationGate
+
             app.state.gate = ConfirmationGate(
-                redis_client=app.state.redis,
-                namespace=config["agent_namespace"],
-                ttl=config["confirmed_token_ttl"],
+                redis_client=app.state.redis, namespace=config["agent_namespace"], ttl=config["confirmed_token_ttl"]
             )
         return app.state.gate
 
     def get_debug_tracer():
         if app.state.debug_tracer is None:
             from .debug import DebugTracer
+
             app.state.debug_tracer = DebugTracer(
-                redis_client=app.state.redis,
-                namespace=config["agent_namespace"],
-                enabled=config["debug_enabled"],
+                redis_client=app.state.redis, namespace=config["agent_namespace"], enabled=config["debug_enabled"]
             )
         return app.state.debug_tracer
 
@@ -332,46 +274,18 @@ def create_app() -> FastAPI:
         if app.state.model_backend is None:
             provider = config["model_provider"]
             api_key = config["nvidia_api_key"] if provider == "nvidia" else config["anthropic_api_key"]
-
-            # Use FailoverBackend for NVIDIA to enable model switching
             if provider == "nvidia":
                 from .model_router import NIM_MODELS, FailoverBackend
-                # Allow custom model list via env var, fallback to default NIM_MODELS
-                app.state.model_backend = FailoverBackend(
-                    models=NIM_MODELS,
-                    api_key=api_key,
-                )
-                print(f"[GATEWAY] Initialized FailoverBackend with {len(NIM_MODELS)} models")
-                print(f"[GATEWAY] Primary model: {NIM_MODELS[0].name}")
+
+                app.state.model_backend = FailoverBackend(models=NIM_MODELS, api_key=api_key)
+                logger.info("FailoverBackend with %d models, primary %s", len(NIM_MODELS), NIM_MODELS[0].name)
             else:
                 from .provider import get_backend
-                model = config["model_name"]
-                app.state.model_backend = get_backend(provider, model, api_key)
+
+                app.state.model_backend = get_backend(provider, config["model_name"], api_key)
         return app.state.model_backend
 
-    def get_agent():
-        if app.state.agent is None:
-            from .agent import Agent
-
-            system_prompt = _load_system_prompt()
-            app.state.agent = Agent(
-                backend_client=get_backend_client(),
-                gate=get_gate(),
-                model_backend=get_model_backend(),
-                debug_tracer=get_debug_tracer(),
-                system_prompt=system_prompt,
-                redis_client=app.state.redis,
-                vector_namespace=config["agent_namespace"],
-                knowledge_service=get_knowledge_service(),
-            )
-        return app.state.agent
-
     def get_knowledge_service():
-        """Build the KnowledgeService lazily from the same Redis client,
-        versioned index namespace, and embedder used by the KB sync. Reusing the
-        shared ``KnowledgeConfig.index_namespace`` is what makes semantic_search
-        hit the index that the sync populates (the root cause of searches
-        returning empty when Redis/KnowledgeService was never wired in)."""
         if app.state.knowledge_service is not None:
             return app.state.knowledge_service
         from mcp_server.knowledge.config import load_knowledge_config
@@ -387,149 +301,173 @@ def create_app() -> FastAPI:
             batch_size=kb_config.embedding_batch_size,
             timeout=kb_config.embedding_timeout,
         )
-        app.state.knowledge_service = KnowledgeService(
-            redis_client=app.state.redis,
-            embedder=embedder,
-            config=kb_config,
-        )
+        app.state.knowledge_service = KnowledgeService(redis_client=app.state.redis, embedder=embedder, config=kb_config)
         return app.state.knowledge_service
+
+    def get_agent():
+        if app.state.agent is None:
+            from .agent import Agent
+
+            try:
+                knowledge = get_knowledge_service()
+            except Exception:
+                # Products are answered from the live catalog; a broken index must not take search down.
+                logger.exception("knowledge service unavailable; continuing without it")
+                knowledge = None
+            app.state.agent = Agent(
+                backend_client=get_backend_client(),
+                gate=get_gate(),
+                model_backend=get_model_backend(),
+                debug_tracer=get_debug_tracer(),
+                system_prompt=_load_system_prompt(),
+                redis_client=app.state.redis,
+                vector_namespace=config["agent_namespace"],
+                knowledge_service=knowledge,
+            )
+        return app.state.agent
 
     def get_session_store():
         from .session import SessionStore
+
         return SessionStore(redis_client=app.state.redis, namespace=config["agent_namespace"])
+
+    def require_debug(key: str | None) -> None:
+        if not config["debug_enabled"] or not config["debug_key"]:
+            raise HTTPException(404, "Not found")
+        if not key or not hmac.compare_digest(key, config["debug_key"]):
+            raise HTTPException(403, "Invalid debug key")
+
+    async def resolve_identity(session) -> None:
+        """Fill user_id and role from the backend; drop an expired or invalid token."""
+        if not session.user_token:
+            session.user_id = session.role = None
+            return
+        try:
+            body = await asyncio.wait_for(
+                get_backend_client().call("GET", "/auth/me", token=session.user_token), timeout=6.0
+            )
+            if isinstance(body, dict):
+                session.user_id = str(body.get("id") or "") or None
+                session.role = body.get("role") or None
+        except Exception as exc:
+            kind = getattr(exc, "error_kind", "")
+            if kind in ("unauthenticated", "permission_denied"):
+                logger.info("dropping an expired or invalid user token for session %s", session.session_id)
+                session.user_token = None
+                session.user_id = session.role = None
+            else:
+                logger.warning("could not resolve identity: %r", exc)
+
+    # ---------------------------------------------------------------- health
 
     @app.get("/health")
     async def health():
-        redis_status = "connected" if app.state.redis_connected else "disconnected"
-        return {"status": "ok", "service": "agent-gateway", "redis": redis_status}
+        return {"status": "ok", "service": "agent-gateway", "redis": "connected" if app.state.redis_connected else "disconnected"}
 
     @app.get("/ready")
     async def ready():
-        """Readiness probe — verifies Redis connectivity for orchestrators."""
         if not app.state.redis_connected:
             raise HTTPException(503, "Redis unavailable")
-        return {"ready": True, "redis": "ok"}
+        if app.state.selftest.get("status") == "failed":
+            raise HTTPException(503, f"Backend unreachable: {app.state.selftest.get('error')}")
+        return {"ready": True, "redis": "ok", "backend": app.state.selftest.get("status")}
+
+    # ---------------------------------------------------------------- chat
 
     @app.post("/sse")
     async def sse_stream(body: SseRequest):
-        """Stream agent events to the browser via SSE."""
-        session_id = body.session_id
-        message = body.message
-        confirmed_token = body.confirmed_token
-        user_token = body.user_token
+        """Stream one agent turn to the browser via SSE."""
+        user_token = normalize_token(body.user_token)  # accept 'Bearer x' and 'x'
 
-        sessions = get_session_store()
-        if session_id:
-            session = await sessions.get_session(session_id)
+        async def failed(message: str) -> AsyncIterator[str]:
+            yield sse("error", {"error": message})
+
+        try:
+            sessions = get_session_store()
+            session = await sessions.get_session(body.session_id) if body.session_id else None
             if session is None:
                 session = await sessions.create_session(user_token=user_token)
-            elif user_token and not session.token:
+                await resolve_identity(session)
+            elif session.user_token != user_token:  # newest token wins; a missing token means signed out
                 session.user_token = user_token
-        else:
-            session = await sessions.create_session(user_token=user_token)
-
-        agent = get_agent()
-
-        async def event_stream() -> AsyncIterator[str]:
-            turn_id = session.current_turn_id + 1
-            yield (
-                "event: session\n"
-                f"data: {json.dumps({'session_id': session.session_id, 'turn_id': turn_id})}\n\n"
+                await resolve_identity(session)
+            agent = get_agent()
+        except Exception:
+            logger.exception("could not start a turn")
+            return StreamingResponse(
+                failed("The assistant is temporarily unavailable. Please try again in a moment."),
+                media_type="text/event-stream",
             )
-            directives: list[dict] = []
-            has_text = False
-            text_buf = ""
-            text_last = time.monotonic()
-            try:
-                agen = agent.run_turn(session, message, confirmed_token)
-                async with asyncio.timeout(_TURNTIMEOUT):
-                    while True:
-                        try:
-                            event = await asyncio.wait_for(anext(agen), timeout=_HEARTBEAT)
-                        except TimeoutError:
-                            if text_buf:
-                                ev = {"type": "text", "content": text_buf, "turn_id": turn_id}
-                                yield f"event: text\ndata: {json.dumps(ev)}\n\n"
-                                text_buf, text_last = "", time.monotonic()
-                            yield ": ping\n\n"
-                            continue
-                        except StopAsyncIteration:
-                            break
-                        event["turn_id"] = turn_id
-                        etype = event.get("type")
-                        if etype == "ui_directive":
-                            directives.append(event.get("directive"))
-                        elif etype == "text":
-                            has_text = True
-                            text_buf += event.get("content", "")
-                            if len(text_buf) >= 24 or time.monotonic() - text_last >= 0.05:
-                                ev = {"type": "text", "content": text_buf, "turn_id": turn_id}
-                                yield f"event: text\ndata: {json.dumps(ev)}\n\n"
-                                text_buf, text_last = "", time.monotonic()
-                        else:
-                            yield f"event: {etype}\ndata: {json.dumps(event)}\n\n"
-                if text_buf:
-                    ev = {"type": "text", "content": text_buf, "turn_id": turn_id}
-                    yield f"event: text\ndata: {json.dumps(ev)}\n\n"
-                finalized = finalize_directives(directives, has_text)
-                if not finalized and not has_text:
-                    yield (
-                        "event: text\n"
-                        f"data: {json.dumps({'content': "I couldn't find any results. Try a broader search.", 'turn_id': turn_id})}\n\n"
-                    )
-                for d in finalized:
-                    yield (
-                        "event: ui_directive\n"
-                        f"data: {json.dumps({'type': 'ui_directive', 'directive': d, 'turn_id': turn_id})}\n\n"
-                    )
-                await sessions.save_session(session)
-            except TimeoutError:
-                yield (
-                    "event: error\n"
-                    f"data: {json.dumps({'error': 'The agent took too long to respond. Please try again.', 'turn_id': turn_id})}\n\n"
-                )
-            except Exception as e:
-                yield (
-                    "event: error\n"
-                    f"data: {json.dumps({'error': str(e), 'turn_id': turn_id})}\n\n"
-                )
 
         return StreamingResponse(
-            event_stream(),
+            stream_turn(
+                agent=agent,
+                session=session,
+                message=body.message,
+                confirmed_token=body.confirmed_token,
+                save_session=lambda: sessions.save_session(session),
+                turn_timeout=config["turn_timeout"],
+                heartbeat=config["heartbeat"],
+            ),
             media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "X-Accel-Buffering": "no",
-                "Connection": "keep-alive",
-            },
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
         )
 
+    # ---------------------------------------------------------------- debug (guarded)
+
+    @app.get("/debug/config")
+    async def debug_config(x_debug_key: str | None = Header(None)):
+        require_debug(x_debug_key)
+        return {
+            "backend_host": __import__("urllib.parse", fromlist=["urlparse"]).urlparse(config["backend_api_url"]).netloc,
+            "backend_prefix": config["backend_api_prefix"],
+            "redis_connected": app.state.redis_connected,
+            "model_provider": config["model_provider"],
+            "selftest": app.state.selftest,
+            "kb": app.state.kb_status,
+        }
+
+    @app.get("/debug/search")
+    async def debug_search(q: str = Query(...), x_debug_key: str | None = Header(None)):
+        """Run the exact product search pipeline and show each step. The fastest way to see why a search is empty."""
+        require_debug(x_debug_key)
+        from .search_pipeline import search_catalog
+
+        client = get_backend_client()
+        calls: list[dict[str, Any]] = []
+
+        async def fetch(params: dict[str, Any]):
+            body = await client.call("GET", "/catalog/products", params=params)
+            items = body.get("items", body) if isinstance(body, dict) else body
+            calls.append({"params": params, "returned": len(items) if isinstance(items, list) else -1})
+            return items if isinstance(items, list) else []
+
+        outcome = await search_catalog(fetch, query=q, limit=10)
+        return {
+            "strategy": outcome.strategy,
+            "total": outcome.total,
+            "steps": outcome.attempts,
+            "backend_calls": calls,
+            "sample": [{"id": p.get("id"), "title": p.get("title") or p.get("name"), "status": p.get("status")} for p in outcome.items],
+        }
 
     @app.get("/debug/sessions/{session_id}/trace")
-    async def debug_trace(session_id: str):
-        """Get the full debug trace for a session (postmortem)."""
-        if not config["debug_enabled"]:
-            raise HTTPException(403, "Debug mode is disabled")
+    async def debug_trace(session_id: str, x_debug_key: str | None = Header(None)):
+        require_debug(x_debug_key)
         tracer = get_debug_tracer()
-        trace = tracer.get_trace(session_id)
-        if not trace:
-            trace = await tracer.load_trace(session_id)
+        trace = tracer.get_trace(session_id) or await tracer.load_trace(session_id)
         return {"session_id": session_id, "events": trace}
 
     @app.get("/debug/sessions/{session_id}/events")
-    async def debug_events(session_id: str):
-        """Stream live debug events for a session."""
-        if not config["debug_enabled"]:
-            raise HTTPException(403, "Debug mode is disabled")
+    async def debug_events(session_id: str, x_debug_key: str | None = Header(None)):
+        require_debug(x_debug_key)
         tracer = get_debug_tracer()
 
         async def event_stream() -> AsyncIterator[str]:
-            import asyncio
             last_count = 0
             while True:
                 events = tracer.get_trace(session_id)
-                new_events = events[last_count:]
-                for event in new_events:
+                for event in events[last_count:]:
                     yield f"event: {event['event_type']}\ndata: {json.dumps(event)}\n\n"
                 last_count = len(events)
                 await asyncio.sleep(0.5)
@@ -541,6 +479,6 @@ def create_app() -> FastAPI:
 
 if __name__ == "__main__":
     import uvicorn
-    config = _load_config()
-    app = create_app()
-    uvicorn.run(app, host=config["gateway_host"], port=config["gateway_port"])
+
+    cfg = _load_config()
+    uvicorn.run(create_app(), host=cfg["gateway_host"], port=cfg["gateway_port"])

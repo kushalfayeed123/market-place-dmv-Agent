@@ -123,6 +123,7 @@ def create_server(
     session: Any,
     redis_client: Any = None,
     vector_namespace: str = "agent",
+    knowledge_service: Any = None,
 ) -> Any:
     """Create and configure the MCP server with all tools registered.
 
@@ -159,7 +160,13 @@ def create_server(
     register_fulfillment_tools(server, backend_client, bridge)
 
     # Knowledge/RAG tools need Redis; register only when available.
+    # The KnowledgeService (with hybrid vector + lexical + fuzzy scoring) is
+    # wired in from the gateway when available, so semantic_search hits the
+    # same version-controlled index the KB sync populates.
     if redis_client is not None:
-        register_knowledge_tools(server, redis_client, vector_namespace)
+        register_knowledge_tools(
+            server, redis_client, vector_namespace,
+            knowledge_service=knowledge_service,
+        )
 
     return server
