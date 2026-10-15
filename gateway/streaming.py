@@ -23,7 +23,7 @@ from typing import Any
 
 logger = logging.getLogger("gateway.stream")
 
-_KEEP_LATEST = {"CartSummary", "OrderList", "MerchantBalanceCard", "LedgerTable"}
+_KEEP_LATEST = {"CartSummary", "OrderList", "MerchantBalanceCard", "LedgerTable", "PaymentCapturePanel"}
 FALLBACK_TEXT = "I couldn't find any results. Try a broader search."
 
 
@@ -123,6 +123,24 @@ async def stream_turn(
     turn_id = session.current_turn_id + 1
     started = time.monotonic()
     yield sse("session", {"session_id": session.session_id, "turn_id": turn_id})
+
+    # Store the confirmation token in Redis so the ConfirmationGate can verify it
+    # when a mutating_financial tool is called during this turn. The token was
+    # minted by the frontend on a real DOM click event and is single-use.
+    if confirmed_token and hasattr(agent, "_gate"):
+        from mcp_server.tools_catalog import BY_NAME
+        stored = False
+        for tool_meta in BY_NAME.values():
+            if tool_meta.requires_confirmation:
+                await agent._gate.store_token(
+                    session.session_id, turn_id, tool_meta.name, confirmed_token
+                )
+                stored = True
+        if stored:
+            logger.debug(
+                "stored confirmed_token session=%s turn=%s tools=%d",
+                session.session_id, turn_id, len(BY_NAME),
+            )
 
     queue: asyncio.Queue = asyncio.Queue()
 

@@ -19,6 +19,8 @@ def _map_payment(p: dict) -> PaymentView:
         amount=_map_price(p.get("amount"), p.get("currency")),
         provider=p.get("provider"),
         provider_reference=p.get("provider_reference"),
+        payment_url=p.get("payment_url"),
+        payment_method=p.get("payment_method"),
         created_at=p.get("created_at"),
         updated_at=p.get("updated_at"),
     )
@@ -50,6 +52,7 @@ def register_payments_tools(
     )
     async def process_payment(
         order_id: str,
+        provider: str = "paystack",
         user_confirmed_token: str | None = None,
         token: str | None = None,
     ) -> dict:
@@ -61,7 +64,7 @@ def register_payments_tools(
         except ConfirmationRequiredError as e:
             raise ToolError(str(e), error_kind="confirmation_required") from e
 
-        payment_body: dict[str, Any] = {"order_id": order_id}
+        payment_body: dict[str, Any] = {"order_id": order_id, "provider": provider}
         idempotency_key = derive_idempotency_key(session.user_id, turn_id, "process_payment", payment_body)
 
         body = await client.call(

@@ -79,6 +79,8 @@ def register_orders_tools(
     async def initiate_checkout(
         user_confirmed_token: str | None = None,
         token: str | None = None,
+        delivery_address: dict | None = None,
+        fulfillment_option: str | None = None,
     ) -> dict:
         """Initiate checkout — translates session cart to backend CheckoutRequest."""
         session_id = session.session_id
@@ -120,6 +122,10 @@ def register_orders_tools(
                 for i in cart.items
             ],
         }
+        if delivery_address:
+            checkout_body["delivery_address"] = delivery_address
+        if fulfillment_option:
+            checkout_body["fulfillment_option"] = fulfillment_option
 
         user_id = session.user_id
         idempotency_key = derive_idempotency_key(user_id, turn_id, "initiate_checkout", checkout_body)
@@ -135,10 +141,12 @@ def register_orders_tools(
 
         return CheckoutView(
             order_id=str(body.get("id", body.get("order_id", ""))),
+            order_number=str(body.get("order_number", body.get("order_id", ""))),
             status=body.get("status", "pending"),
             total=_map_price(body.get("total_amount"), body.get("currency")),
             item_count=body.get("item_count", cart.item_count),
             payment_required=body.get("payment_required", True),
+            payment_url=body.get("payment_url"),
             message=body.get("message", "Checkout initiated. Awaiting payment."),
         ).model_dump()
 

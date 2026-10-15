@@ -51,7 +51,7 @@ class TestCartView:
 
 class TestCheckoutView:
     def test_checkout(self):
-        v = CheckoutView(order_id="o1", status="pending",
+        v = CheckoutView(order_id="o1", order_number="ORD-001", status="pending",
             total=PriceView(amount=18500, currency="NGN", display=N+"185"), item_count=3)
         assert v.order_id == "o1"
         assert v.payment_required is True

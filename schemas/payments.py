@@ -15,6 +15,14 @@ class PaymentView(BaseModel):
     amount: PriceView
     provider: Optional[str] = Field(None, description="e.g. 'paystack'")
     provider_reference: Optional[str] = None
+    payment_url: Optional[str] = Field(
+        None,
+        description="URL the buyer must visit to complete the payment",
+    )
+    payment_method: Optional[str] = Field(
+        None,
+        description="Payment method type, e.g. 'card', 'bank_transfer'",
+    )
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
 

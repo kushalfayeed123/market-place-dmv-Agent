@@ -44,8 +44,10 @@ class OrderDetailView(OrderSummaryView):
 class CheckoutView(BaseModel):
     """Result of a successful initiate_checkout call."""
     order_id: str
+    order_number: str
     status: str
     total: PriceView
     item_count: int
     payment_required: bool = True
+    payment_url: Optional[str] = None
     message: str = "Checkout initiated. Awaiting payment."

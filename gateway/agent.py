@@ -352,7 +352,11 @@ class Agent:
                         "type": "ui_directive",
                         "directive": UIDirective(
                             component=ComponentName.ConfirmationDialog,
-                            props={"tool_name": tool_name, "message": result.get("message", "Please confirm.")},
+                            props={
+                                "tool_name": tool_name,
+                                "title": "Confirm to proceed",
+                                "message": result.get("message", "Please confirm this action."),
+                            },
                             correlation_id=session_id,
                         ).model_dump(),
                     }
@@ -651,7 +655,8 @@ class Agent:
             "add_to_cart": ComponentName.CartSummary,
             "update_cart_items": ComponentName.CartSummary,
             "remove_from_cart": ComponentName.CartSummary,
-            "initiate_checkout": ComponentName.OrderConfirmation,
+            "initiate_checkout": ComponentName.PaymentCapturePanel,
+            "process_payment": ComponentName.PaymentCapturePanel,
             "get_order_status": ComponentName.OrderDetail,
             "list_orders": ComponentName.OrderList,
             "get_merchant_balance": ComponentName.MerchantBalanceCard,
@@ -777,6 +782,13 @@ def _result_to_text(tool_name: str, result: dict[str, Any]) -> str | None:
         return "Your cart is updated."
     if tool_name == "initiate_checkout":
         return "Checkout initiated. Here are your order details."
+    if tool_name == "process_payment":
+        status = data.get("status", "") if isinstance(data, dict) else ""
+        if status == "initialized":
+            return "Payment initialized. Please complete payment at the provider's page."
+        if status == "success":
+            return "Payment processed successfully."
+        return f"Payment status: {status or 'unknown'}." if status else "Payment processed."
     if tool_name == "get_order_status":
         status = data.get("status", "") if isinstance(data, dict) else ""
         order_id = data.get("order_id", "") if isinstance(data, dict) else ""

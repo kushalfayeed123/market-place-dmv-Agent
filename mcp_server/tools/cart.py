@@ -127,7 +127,7 @@ def _build_cart_view(cart: dict) -> CartView:
                 f"{i.product_name} ({i.variant_name}): only {i.quantity_available} available"
             )
 
-        return CartView(
+    return CartView(
         items=items,
         subtotal=_map_price(total_amount, currency),
         item_count=sum(i.quantity for i in items),

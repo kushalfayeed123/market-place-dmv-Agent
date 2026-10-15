@@ -4,7 +4,13 @@ These tests assert the key guarantees of the agent-gateway SSE endpoint.
 """
 import asyncio
 
+import pytest
+import pytest_asyncio
+import fakeredis.aioredis as fakeredis
+
 from gateway.main import finalize_directives, coalesce_text
+from gateway.streaming import stream_turn, sse
+from mcp_server.guards import ConfirmationGate
 
 
 def _dir_list(directives):
@@ -128,4 +134,146 @@ class TestReplyStyleRules:
         text = "I found a great widget for you."
         for symbol in ("\u20a6", "$", "\u20ac"):
             assert symbol not in text
+
+
+class TestConfirmationTokenStorage:
+    """Verify that stream_turn stores the confirmed_token in Redis before the
+    agent's turn begins, so the ConfirmationGate can verify it."""
+
+    @pytest_asyncio.fixture
+    async def redis_client(self):
+        client = fakeredis.FakeRedis(decode_responses=True)
+        yield client
+        await client.flushdb()
+        await client.aclose()
+
+    @pytest_asyncio.fixture
+    async def gate(self, redis_client):
+        return ConfirmationGate(redis_client, namespace="test", ttl=300)
+
+    @pytest.mark.asyncio
+    async def test_stream_turn_stores_confirmed_token(self, redis_client, gate):
+        """stream_turn must store the confirmed_token for mutating_financial tools
+        in Redis before the agent turn runs, so the gate can verify it."""
+
+        class FakeSession:
+            session_id = "sess-test"
+            turn_counter = 0
+            user_token = None
+            user_id = "user-1"
+            role = "buyer"
+            history = []
+            _cart = {"items": []}
+
+            @property
+            def current_turn_id(self):
+                return self.turn_counter
+
+            def next_turn(self):
+                self.turn_counter += 1
+                return self.turn_counter
+
+            def get_cart(self):
+                return self._cart
+
+            def set_cart(self, cart):
+                self._cart = cart
+
+            def clear_cart(self):
+                self._cart = {"items": []}
+
+        class FakeAgent:
+            def __init__(self, gate):
+                self._gate = gate
+                self._model = type("M", (), {"provider_name": "test", "model_name": "test"})()
+
+            async def run_turn(self, session, message, confirmed_token):
+                session.next_turn()
+                yield {"type": "text", "content": "ok"}
+
+        session = FakeSession()
+        agent = FakeAgent(gate)
+
+        # Run stream_turn with a confirmed_token; collect all events.
+        events = []
+        async for frame in stream_turn(
+            agent=agent,
+            session=session,
+            message="Confirmed",
+            confirmed_token="user-token-abc",
+            save_session=lambda: asyncio.sleep(0),
+            turn_timeout=10.0,
+            heartbeat=5.0,
+        ):
+            events.append(frame)
+
+        # The turn_id for turn 1 (first next_turn call) should have the token stored.
+        # stream_turn computes turn_id = current_turn_id + 1 = 0 + 1 = 1 before run_turn
+        # increments it.
+        turn_id = session.current_turn_id  # run_turn called next_turn, so this is 1
+
+        # Verify the token was stored and can be consumed by check_confirmation.
+        # consume_token is single-use: after this, the token is deleted.
+        valid = await gate.consume_token("sess-test", turn_id, "initiate_checkout", "user-token-abc")
+        assert valid is True, "Token should have been stored by stream_turn and be consumable"
+
+        # Second attempt must fail (single-use).
+        valid2 = await gate.consume_token("sess-test", turn_id, "initiate_checkout", "user-token-abc")
+        assert valid2 is False, "Token must be single-use"
+
+    @pytest.mark.asyncio
+    async def test_stream_turn_no_token_without_confirmed_token(self, redis_client, gate):
+        """When no confirmed_token is provided, nothing should be stored in Redis."""
+
+        class FakeSession:
+            session_id = "sess-no-token"
+            turn_counter = 0
+            user_token = None
+            user_id = "user-1"
+            role = "buyer"
+            history = []
+            _cart = {"items": []}
+
+            @property
+            def current_turn_id(self):
+                return self.turn_counter
+
+            def next_turn(self):
+                self.turn_counter += 1
+                return self.turn_counter
+
+            def get_cart(self):
+                return self._cart
+
+            def set_cart(self, cart):
+                self._cart = cart
+
+            def clear_cart(self):
+                self._cart = {"items": []}
+
+        class FakeAgent:
+            def __init__(self, gate):
+                self._gate = gate
+
+            async def run_turn(self, session, message, confirmed_token):
+                session.next_turn()
+                yield {"type": "text", "content": "ok"}
+
+        session = FakeSession()
+        agent = FakeAgent(gate)
+
+        async for _ in stream_turn(
+            agent=agent,
+            session=session,
+            message="hello",
+            confirmed_token=None,
+            save_session=lambda: asyncio.sleep(0),
+            turn_timeout=10.0,
+            heartbeat=5.0,
+        ):
+            pass
+
+        # No token should have been stored.
+        valid = await gate.consume_token("sess-no-token", 1, "initiate_checkout", "any-token")
+        assert valid is False, "No token should have been stored when confirmed_token is None"
 
