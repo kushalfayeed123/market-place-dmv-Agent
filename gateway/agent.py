@@ -467,6 +467,9 @@ class Agent:
             elif meta.method == "VECTOR":
                 data = await self._exec_vector_tool(tool_name, args, session)
             else:
+                # Apply default values from TOOL_PARAMETERS so omitted optional
+                # params (e.g. process_payment.provider) reach the backend.
+                _apply_tool_defaults(tool_name, args)
                 params, path_params, json_body = _build_call_args(meta, args, reserved)
                 body = await self._client.call(
                     meta.method, meta.path, token=token, params=params,
@@ -842,6 +845,22 @@ def _flush_summaries(summary_buffer: list[tuple[str, str, dict[str, Any], bool]]
             continue
         out.append(text)
     return out
+
+
+def _apply_tool_defaults(tool_name: str, args: dict[str, Any]) -> None:
+    """Apply default values from TOOL_PARAMETERS to *args* for missing keys.
+
+    When the model omits a parameter that has a default in the tool schema
+    (for example ``process_payment.provider`` → ``"paystack"``), the default
+    must still be sent to the backend so the Pydantic request model is
+    satisfied.  Without this, a 422 ``Field required`` is returned.
+    """
+    from mcp_server.tools_catalog import TOOL_PARAMETERS
+
+    schema = TOOL_PARAMETERS.get(tool_name, {})
+    for prop_name, prop_schema in schema.get("properties", {}).items():
+        if prop_name not in args and "default" in prop_schema:
+            args[prop_name] = prop_schema["default"]
 
 
 def _build_call_args(meta: Any, args: dict[str, Any], reserved: set[str]):
