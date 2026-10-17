@@ -154,7 +154,7 @@ PROCESS_PAYMENT = ToolMeta(
     risk_tier=RiskTier.HIGH,
     requires_confirmation=True,
     visible_to=frozenset({"buyer", "platform_admin"}),
-    description="Process payment for an order. HIGH risk — financial. Requires user confirmation.",
+    description="Process payment for an order. HIGH risk — financial. Requires user confirmation. Supports 'paystack' (online redirect) or 'pay_on_delivery' (merchant confirms after delivery).",
 )
 
 GET_PAYMENT_STATUS = ToolMeta(
@@ -544,7 +544,11 @@ TOOL_PARAMETERS: dict[str, dict[str, Any]] = {
         "type": "object",
         "properties": {
             "order_id": {"type": "string", "description": "The order to pay for."},
-            "provider": {"type": "string", "description": "Payment provider, e.g. 'paystack'.", "default": "paystack"},
+            "provider": {
+                "type": "string",
+                "description": "Payment provider: 'paystack' for card/mobile money online (redirects to checkout), or 'pay_on_delivery' to place the order for merchant confirmation after delivery.",
+                "default": "paystack",
+            },
         },
         "required": ["order_id"],
     },

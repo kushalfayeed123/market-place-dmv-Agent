@@ -74,8 +74,11 @@ cents for USD).** A value of `100800` means **₦1,008**, not ₦100,800.
 3. User clicks "Confirm" → frontend mints `user_confirmed_token`
 4. Call `initiate_checkout(user_confirmed_token=...)` with idempotency
 5. Render `PaymentCapturePanel` directive (fixed frontend widget)
-6. Poll `get_order_status(order_id)` until status = "paid"
-7. Render `OrderConfirmation` from the **backend-confirmed** status
+6. Offer payment methods:
+   - "Pay Now" → call `process_payment(provider="paystack")` → buyer redirected to provider checkout
+   - "Pay on Delivery" → call `process_payment(provider="pay_on_delivery")` → order placed, merchant confirms payment after delivery; order enters awaiting_approval until the merchant confirms
+7. Poll `get_order_status(order_id)` until status = "paid"
+8. Render `OrderConfirmation` from the **backend-confirmed** status
 
 ## Component Allowlist
 
