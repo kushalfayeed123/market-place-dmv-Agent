@@ -50,4 +50,5 @@ class CheckoutView(BaseModel):
     item_count: int
     payment_required: bool = True
     payment_url: Optional[str] = None
+    payment_method: Optional[str] = None
     message: str = "Checkout initiated. Awaiting payment."

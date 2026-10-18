@@ -81,6 +81,7 @@ def register_orders_tools(
         token: str | None = None,
         delivery_address: dict | None = None,
         fulfillment_option: str | None = None,
+        payment_method: str | None = None,
     ) -> dict:
         """Initiate checkout — translates session cart to backend CheckoutRequest."""
         session_id = session.session_id
@@ -116,7 +117,7 @@ def register_orders_tools(
         if cart.is_empty:
             raise ToolError("Cart is empty. Add items before checkout.", error_kind="validation_error")
 
-        checkout_body = {
+        checkout_body: dict[str, Any] = {
             "items": [
                 {"variant_id": i.variant_id, "quantity": i.quantity}
                 for i in cart.items
@@ -126,6 +127,8 @@ def register_orders_tools(
             checkout_body["delivery_address"] = delivery_address
         if fulfillment_option:
             checkout_body["fulfillment_option"] = fulfillment_option
+        if payment_method:
+            checkout_body["payment_method"] = payment_method
 
         user_id = session.user_id
         idempotency_key = derive_idempotency_key(user_id, turn_id, "initiate_checkout", checkout_body)
@@ -147,6 +150,7 @@ def register_orders_tools(
             item_count=body.get("item_count", cart.item_count),
             payment_required=body.get("payment_required", True),
             payment_url=body.get("payment_url"),
+            payment_method=payment_method or body.get("payment_method"),
             message=body.get("message", "Checkout initiated. Awaiting payment."),
         ).model_dump()
 

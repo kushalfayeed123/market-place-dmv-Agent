@@ -669,7 +669,15 @@ class Agent:
         component = component_map.get(tool_name)
         if not component:
             return None
-        props = _strip_sensitive(result.get("data", {}))
+        raw_props = result.get("data", {})
+        # Some tools (e.g. list_orders) return a list at the top level.
+        # UIDirective.props must be a dict, so wrap lists sensibly.
+        if isinstance(raw_props, list):
+            if component == ComponentName.OrderList:
+                raw_props = {"orders": raw_props}
+            else:
+                raw_props = {"items": raw_props}
+        props = _strip_sensitive(raw_props)
         if component == ComponentName.ProductGrid:
             props = _grid_props(props)
         return UIDirective(component=component, props=props, correlation_id=session_id).model_dump()

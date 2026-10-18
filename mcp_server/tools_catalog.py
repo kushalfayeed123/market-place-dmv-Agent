@@ -531,6 +531,11 @@ TOOL_PARAMETERS: dict[str, dict[str, Any]] = {
         "properties": {
             "items": {"type": "array", "description": "Cart items to checkout.", "items": {"type": "object"}},
             "shipping_address": {"type": "object", "description": "Shipping address for physical goods."},
+            "payment_method": {
+                "type": "string",
+                "description": "Payment method: 'paystack' for online card/mobile money checkout, or 'pay_on_delivery' for merchant-confirmed payment on delivery.",
+                "default": "paystack",
+            },
         },
         "required": ["items"],
     },

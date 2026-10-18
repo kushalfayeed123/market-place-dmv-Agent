@@ -25,6 +25,8 @@ class ComponentName(str, Enum):
     ConfirmationDialog = "ConfirmationDialog"
     PaymentCapturePanel = "PaymentCapturePanel"
     OrderConfirmation = "OrderConfirmation"
+    OrderSuccess = "OrderSuccess"
+    PaymentSelection = "PaymentSelection"
     # Orders
     OrderList = "OrderList"
     OrderDetail = "OrderDetail"
