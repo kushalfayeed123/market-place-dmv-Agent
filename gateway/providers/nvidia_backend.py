@@ -20,6 +20,9 @@ RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 MAX_RETRIES = 3
 BASE_RETRY_DELAY = 1.0  # seconds
 
+# Status codes that are permanent — retrying wastes tokens and time.
+PERMANENT_STATUS_CODES = {401, 403, 404, 410}
+
 
 def _is_rate_limit_error(status_code: int, response_text: str) -> bool:
     """Check if the error is a rate limit or resource exhaustion error."""
@@ -41,23 +44,30 @@ async def _retry_with_backoff(
     *args,
     max_retries: int = MAX_RETRIES,
     base_delay: float = BASE_RETRY_DELAY,
+    status_code: int | None = None,
     **kwargs,
 ) -> Any:
-    """Execute a function with exponential backoff retry for transient errors."""
+    """Execute a function with exponential backoff retry for transient errors.
+
+    Permanent HTTP errors (401/403/404/410) are never retried.
+    """
     last_exception = None
     for attempt in range(max_retries + 1):
         try:
             result = await func(*args, **kwargs)
-            # If result is a dict with error, check if it's retryable
             if isinstance(result, dict) and result.get("error"):
+                # Extract status_code from result (classify path) or parameter.
+                result_status = result.get("status_code") or status_code
+                if result_status is not None and result_status in PERMANENT_STATUS_CODES:
+                    return result
                 error_msg = result.get("error", "")
-                # Check if error message indicates a retryable error
                 if (
                     any(
                         code in error_msg
                         for code in ["429", "500", "502", "503", "504"]
                     )
                     and attempt < max_retries
+                    and result_status not in PERMANENT_STATUS_CODES
                 ):
                     delay = base_delay * (2**attempt)
                     print(
@@ -157,6 +167,7 @@ class NvidiaBackend(ModelBackend):
                         "confidence": 0.0,
                         "reasoning": "",
                         "error": error_msg,
+                        "status_code": resp.status_code,
                     }
                 data = resp.json()
                 content = data["choices"][0]["message"]["content"]
@@ -164,7 +175,16 @@ class NvidiaBackend(ModelBackend):
                 return _parse_classification(content, valid_intents)
 
         try:
-            return await _retry_with_backoff(_do_classify)
+            result = await _retry_with_backoff(_do_classify)
+            # If the result indicates a permanent error, add status_code for FailoverBackend
+            if result.get("error") and "status_code" not in result:
+                # Extract status code from error string for classification
+                msg = result.get("error", "")
+                for code in PERMANENT_STATUS_CODES | RETRYABLE_STATUS_CODES:
+                    if f" {code}" in msg:
+                        result["status_code"] = code
+                        break
+            return result
         except Exception as e:
             error_msg = f"Exception: {e!s}"
             print(f"[NVIDIA] Classification error: {error_msg}")
@@ -226,7 +246,16 @@ class NvidiaBackend(ModelBackend):
                         error_msg = f"NVIDIA API error {response.status_code}: {body.decode()[:500]}"
                         print(f"[NVIDIA] Stream error: {error_msg}")
 
-                        # Check if this is a retryable error
+                        # Permanent errors — don't retry, yield immediately.
+                        if response.status_code in PERMANENT_STATUS_CODES:
+                            yield {
+                                "type": "error",
+                                "error": error_msg,
+                                "status_code": response.status_code,
+                            }
+                            return
+
+                        # Transient errors — retry with backoff.
                         if (
                             _is_rate_limit_error(response.status_code, body.decode())
                             and attempt < MAX_RETRIES
@@ -239,6 +268,7 @@ class NvidiaBackend(ModelBackend):
                         yield {
                             "type": "error",
                             "error": error_msg,
+                            "status_code": response.status_code,
                         }
                         return
 
@@ -263,7 +293,7 @@ class NvidiaBackend(ModelBackend):
                     print(f"[NVIDIA] Retrying in {delay:.1f}s...")
                     await asyncio.sleep(delay)
                     continue
-                yield {"type": "error", "error": error_msg}
+                yield {"type": "error", "error": error_msg, "status_code": 408}
                 return
             except Exception as e:
                 error_msg = f"Unexpected error: {e!s}"
@@ -273,7 +303,7 @@ class NvidiaBackend(ModelBackend):
                     print(f"[NVIDIA] Retrying in {delay:.1f}s...")
                     await asyncio.sleep(delay)
                     continue
-                yield {"type": "error", "error": error_msg}
+                yield {"type": "error", "error": error_msg, "status_code": None}
                 return
 
 

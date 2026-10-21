@@ -12,8 +12,11 @@ from dataclasses import dataclass, field
 
 # Pinned embedding model + dimension. Changing the model changes the index
 # namespace (build-new-then-swap reindex); never edit these casually.
-EMBEDDING_MODEL_NVIDIA = "nvidia/nv-embedqa-e5-v5"
-EMBEDDING_DIM_NVIDIA = 1024
+# Updated per probe results (2026-10-20):
+#   nvidia/nv-embedqa-e5-v5 → 410 Gone (retired)
+#   nvidia/nemotron-3-embed-1b → 200 OK, dim=2048, input_type supported
+EMBEDDING_MODEL_NVIDIA = "nvidia/nemotron-3-embed-1b"
+EMBEDDING_DIM_NVIDIA = 2048
 
 
 def _int_env(env: dict[str, str], name: str, default: int) -> int:

@@ -27,9 +27,9 @@ class Embedder(Protocol):
     @property
     def model_name(self) -> str: ...
 
-    async def embed(self, text: str) -> list[float]: ...
+    async def embed(self, text: str, input_type: str | None = None) -> list[float]: ...
 
-    async def embed_batch(self, texts: list[str]) -> list[list[float]]: ...
+    async def embed_batch(self, texts: list[str], input_type: str | None = None) -> list[list[float]]: ...
 
 
 def _l2_normalize(vec: list[float]) -> list[float]:
@@ -49,12 +49,13 @@ class NvidiaEmbedder:
 
     def __init__(
         self,
-        model: str = "nvidia/nv-embedqa-e5-v5",
+        model: str = "nvidia/nemotron-3-embed-1b",
         api_key: str = "",
-        dim: int = 1024,
+        dim: int = 2048,
         batch_size: int = 64,
         timeout: float = 60.0,
         max_retries: int = 3,
+        default_input_type: str = "query",
     ):
         self._model = model
         self._api_key = api_key
@@ -62,6 +63,7 @@ class NvidiaEmbedder:
         self._batch_size = max(1, batch_size)
         self._timeout = timeout
         self._max_retries = max_retries
+        self._default_input_type = default_input_type
 
     @property
     def dim(self) -> int:
@@ -71,28 +73,42 @@ class NvidiaEmbedder:
     def model_name(self) -> str:
         return self._model
 
-    async def embed(self, text: str) -> list[float]:
-        return (await self.embed_batch([text]))[0]
+    async def embed(self, text: str, input_type: str | None = None) -> list[float]:
+        return (await self.embed_batch([text], input_type=input_type))[0]
 
-    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+    async def embed_batch(
+        self, texts: list[str], input_type: str | None = None
+    ) -> list[list[float]]:
         if not texts:
             return []
+        itype = input_type or self._default_input_type
         out: list[list[float]] = []
         for i in range(0, len(texts), self._batch_size):
             batch = texts[i : i + self._batch_size]
-            out.extend(await self._embed_request(batch))
+            out.extend(await self._embed_request(batch, itype))
         return out
 
-    async def _embed_request(self, batch: list[str]) -> list[list[float]]:
+    async def _embed_request(self, batch: list[str], input_type: str = "query") -> list[list[float]]:
         import httpx  # local import keeps httpx optional for TF-IDF-only setups
 
-        payload = {"input": batch, "model": self._model, "input_type": "query", "encoding_format": "float", "truncate": "END"}
+        payload = {
+            "input": batch,
+            "model": self._model,
+            "input_type": input_type,
+            "encoding_format": "float",
+            "truncate": "END",
+        }
         headers = {"Authorization": f"Bearer {self._api_key}", "Content-Type": "application/json", "Accept": "application/json"}
         last_exc: Exception | None = None
+        _PERMANENT_CODES = {400, 401, 403, 404, 410}
         for attempt in range(self._max_retries):
             try:
                 async with httpx.AsyncClient(timeout=self._timeout) as client:
                     resp = await client.post(self.NIM_BASE_URL, json=payload, headers=headers)
+                if resp.status_code in _PERMANENT_CODES:
+                    raise RuntimeError(
+                        f"NVIDIA embeddings permanent error: HTTP {resp.status_code}: {resp.text[:200]}"
+                    )
                 if resp.status_code == 429 or resp.status_code >= 500:
                     raise RuntimeError(f"NVIDIA embeddings transient failure: HTTP {resp.status_code}")
                 resp.raise_for_status()
@@ -102,10 +118,19 @@ class NvidiaEmbedder:
                 if len(vecs) != len(batch):
                     raise RuntimeError(f"Embedding count mismatch: sent {len(batch)}, got {len(vecs)}")
                 return vecs
-            except Exception as exc:  # noqa: BLE001 — deliberate: retry then raise
+            except RuntimeError as exc:
+                last_exc = exc
+                # Permanent errors — raise immediately, don't retry.
+                if "permanent error" in str(exc):
+                    raise
+                if attempt < self._max_retries - 1:
+                    await asyncio.sleep(2**attempt)
+                    continue
+            except Exception as exc:
                 last_exc = exc
                 if attempt < self._max_retries - 1:
                     await asyncio.sleep(2**attempt)
+                    continue
         raise RuntimeError(f"NVIDIA embedding failed after {self._max_retries} attempts: {last_exc}")
 
 
@@ -139,10 +164,10 @@ class FakeEmbedder:
             vec[(h >> 17) % self._dim] += 0.5
         return _l2_normalize(vec)
 
-    async def embed(self, text: str) -> list[float]:
+    async def embed(self, text: str, input_type: str | None = None) -> list[float]:
         return self._vectorize(text)
 
-    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+    async def embed_batch(self, texts: list[str], input_type: str | None = None) -> list[list[float]]:
         return [self._vectorize(t) for t in texts]
 
 
@@ -172,10 +197,11 @@ def create_embedder(
     """
     provider = provider.lower()
     if provider == "nvidia":
+        from mcp_server.knowledge.config import EMBEDDING_MODEL_NVIDIA, EMBEDDING_DIM_NVIDIA
         return NvidiaEmbedder(
-            model=model or "nvidia/nv-embedqa-e5-v5",
+            model=model or EMBEDDING_MODEL_NVIDIA,
             api_key=api_key,
-            dim=dim or 1024,
+            dim=dim or EMBEDDING_DIM_NVIDIA,
             batch_size=batch_size,
             timeout=timeout,
         )
@@ -207,9 +233,9 @@ class _TfidfAdapter:
     def fit(self, documents: list[str]) -> None:
         self._inner.fit(documents)
 
-    async def embed(self, text: str) -> list[float]:
+    async def embed(self, text: str, input_type: str | None = None) -> list[float]:
         return await self._inner.embed(text)
 
-    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+    async def embed_batch(self, texts: list[str], input_type: str | None = None) -> list[list[float]]:
         return await self._inner.embed_batch(texts)
 

@@ -65,6 +65,7 @@ def _load_config() -> dict:
         "model_name": os.getenv("AGENT_MODEL", "nvidia/llama-3.1-nemotron-70b-instruct"),
         "nvidia_api_key": os.getenv("NVIDIA_API_KEY", ""),
         "anthropic_api_key": os.getenv("ANTHROPIC_API_KEY", ""),
+        "chat_models": os.getenv("NVIDIA_CHAT_MODELS", ""),
         # Debug endpoints are OFF unless AGENT_DEBUG=1, and then require X-Debug-Key.
         "debug_enabled": os.getenv("AGENT_DEBUG", "0") == "1",
         "debug_key": os.getenv("AGENT_DEBUG_KEY", ""),
@@ -185,6 +186,39 @@ async def _self_test(app: FastAPI) -> None:
         logger.error("STARTUP SELF-TEST FAILED: the agent cannot reach the catalog (%s)", result["error"])
 
 
+async def _probe_models(app: FastAPI) -> None:
+    """Lightweight probe at startup — GET /v1/models to verify the API key works."""
+    result: dict[str, Any] = {"status": "pending", "models": []}
+    app.state.model_health = result
+    api_key = app.state.config.get("nvidia_api_key", "")
+    if not api_key:
+        result.update(status="no_key", error="NVIDIA_API_KEY not set")
+        return
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(
+                "https://integrate.api.nvidia.com/v1/models",
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+        if resp.status_code == 200:
+            data = resp.json()
+            model_ids = [m["id"] for m in data.get("data", [])]
+            result["models"] = model_ids
+            result["count"] = len(model_ids)
+            result["status"] = "ok"
+            logger.info("model probe ok: %d models available", len(model_ids))
+        else:
+            result.update(
+                status="error",
+                error=f"HTTP {resp.status_code}: {resp.text[:200]}",
+            )
+            logger.warning("model probe failed: HTTP %d", resp.status_code)
+    except Exception as exc:
+        result.update(status="error", error=f"{type(exc).__name__}: {exc}")
+        logger.warning("model probe error: %s", exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     config = app.state.config
@@ -198,9 +232,14 @@ async def lifespan(app: FastAPI):
     app.state.agent = None
     app.state.knowledge_service = None
     app.state.kb_status = {"runs": 0, "last_sync_at": None, "last_error": None}
+    app.state.model_health = {"status": "pending", "models": []}
     app.state.selftest = {"status": "pending"}
 
-    tasks = [asyncio.create_task(_connect_redis(app)), asyncio.create_task(_self_test(app))]
+    tasks = [
+        asyncio.create_task(_connect_redis(app)),
+        asyncio.create_task(_self_test(app)),
+        asyncio.create_task(_probe_models(app)),
+    ]
     if config["kb_sync_enabled"]:
         app.state.kb_sync_task = asyncio.create_task(_kb_sync_loop(app))
         tasks.append(app.state.kb_sync_task)
@@ -371,6 +410,21 @@ def create_app() -> FastAPI:
         if app.state.selftest.get("status") == "failed":
             raise HTTPException(503, f"Backend unreachable: {app.state.selftest.get('error')}")
         return {"ready": True, "redis": "ok", "backend": app.state.selftest.get("status")}
+
+    @app.get("/health/models")
+    async def health_models():
+        """Report the current state of each model in the failover pool."""
+        backend = app.state.model_backend
+        if backend is None:
+            return {"status": "not_started", "models": []}
+        if hasattr(backend, "all_models") and hasattr(backend, "available_models"):
+            return {
+                "status": "ok" if backend.available_models else "all_dead",
+                "all_models": backend.all_models,
+                "available": backend.available_models,
+                "active": backend.active_model,
+            }
+        return {"status": "ok", "active": getattr(backend, "model_name", "unknown")}
 
     # ---------------------------------------------------------------- chat
 

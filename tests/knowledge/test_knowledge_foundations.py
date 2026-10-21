@@ -42,16 +42,16 @@ class TestEmbedderPort:
 
     def test_factory_builds_nvidia_with_pinned_model(self):
         emb = create_embedder("nvidia", api_key="test-key")
-        assert emb.model_name == "nvidia/nv-embedqa-e5-v5"
-        assert emb.dim == 1024
+        assert emb.model_name == "nvidia/nemotron-3-embed-1b"
+        assert emb.dim == 2048
 
 
 class TestConfig:
     def test_index_namespace_carries_model_and_dim(self):
         cfg = KnowledgeConfig()
         ns = cfg.index_namespace
-        assert "nv_embedqa_e5_v5" in ns
-        assert ":1024" in ns
+        assert "nemotron_3_embed_1b" in ns
+        assert ":2048" in ns
 
     def test_index_version_suffix_changes_namespace(self):
         cfg = KnowledgeConfig(index_version="v2")

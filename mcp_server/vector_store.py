@@ -75,12 +75,12 @@ class TfidfEmbedder:
             vector = [v / norm for v in vector]
         return vector
 
-    async def embed(self, text: str) -> list[float]:
+    async def embed(self, text: str, input_type: str | None = None) -> list[float]:
         if not self._fitted:
             raise RuntimeError("TfidfEmbedder must be fitted")
         return self._vectorize(text)
 
-    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+    async def embed_batch(self, texts: list[str], input_type: str | None = None) -> list[list[float]]:
         if not self._fitted:
             raise RuntimeError("TfidfEmbedder must be fitted")
         return [self._vectorize(t) for t in texts]
@@ -96,10 +96,10 @@ class OpenAIEmbedder:
     def dim(self) -> int:
         return self._dim
 
-    async def embed(self, text: str) -> list[float]:
+    async def embed(self, text: str, input_type: str | None = None) -> list[float]:
         return (await self.embed_batch([text]))[0]
 
-    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+    async def embed_batch(self, texts: list[str], input_type: str | None = None) -> list[list[float]]:
         return await asyncio.to_thread(self._embed_batch_sync, texts)
 
     def _embed_batch_sync(self, texts: list[str]) -> list[list[float]]:
@@ -131,7 +131,7 @@ class VectorStore:
     async def upsert_many(self, docs: list[dict[str, Any]]) -> int:
         """Bulk-index documents. Each doc: {id, text, metadata?}. Returns count."""
         texts = [d["text"] for d in docs]
-        embeddings = await self._embedder.embed_batch(texts)
+        embeddings = await self._embedder.embed_batch(texts, input_type="passage")
         pipe = self._redis.pipeline()
         for doc, embedding in zip(docs, embeddings):
             data = {
@@ -157,7 +157,7 @@ class VectorStore:
         return [t for t in results if t]
 
     async def upsert(self, doc_id: str, text: str, metadata: dict[str, Any] | None = None) -> None:
-        embedding = await self._embedder.embed(text)
+        embedding = await self._embedder.embed(text, input_type="passage")
         data = {"text": text, "embedding": json.dumps(embedding), "metadata": json.dumps(metadata or {})}
         await self._redis.hset(self._key(doc_id), mapping=data)
         await self._redis.sadd(self._meta_key(), doc_id)
@@ -187,7 +187,7 @@ class VectorStore:
     async def search(self, query: str, top_k: int = 5) -> list[dict[str, Any]]:
         if not self._embedder_fitted and hasattr(self._embedder, "_fitted"):
             await self.fit_embedder()
-        query_embedding = await self._embedder.embed(query)
+        query_embedding = await self._embedder.embed(query, input_type="query")
         return await self.search_by_embedding(query_embedding, top_k)
 
     async def search_by_embedding(self, query_embedding: list[float], top_k: int = 5) -> list[dict[str, Any]]:

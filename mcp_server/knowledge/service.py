@@ -193,7 +193,7 @@ class KnowledgeService:
         top_k = top_k or self._config.top_k
         try:
             store = self._get_store()
-            query_vec = await self._embedder.embed(query)
+            query_vec = await self._embedder.embed(query, input_type="query")
             # Over-fetch so filters + lexical re-ranking still leave top_k results.
             candidates = await store.search_by_embedding(query_vec, top_k=max(top_k * 4, 20))
         except Exception as exc:  # noqa: BLE001 — typed graceful degradation
@@ -302,11 +302,11 @@ class _QueryShim:
     def dim(self) -> int:
         return self._e.dim
 
-    async def embed(self, text: str) -> list[float]:
-        return await self._e.embed(text)
+    async def embed(self, text: str, input_type: str | None = None) -> list[float]:
+        return await self._e.embed(text, input_type=input_type)
 
-    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
-        return await self._e.embed_batch(texts)
+    async def embed_batch(self, texts: list[str], input_type: str | None = None) -> list[list[float]]:
+        return await self._e.embed_batch(texts, input_type=input_type)
 
 
 def _safe_json(raw: str) -> dict:

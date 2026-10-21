@@ -114,8 +114,8 @@ class _EmbedderShim:
     def dim(self) -> int:
         return self._e.dim
 
-    async def embed(self, text: str) -> list[float]:
-        return await self._e.embed(text)
+    async def embed(self, text: str, input_type: str | None = None) -> list[float]:
+        return await self._e.embed(text, input_type=input_type)
 
-    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
-        return await self._e.embed_batch(texts)
+    async def embed_batch(self, texts: list[str], input_type: str | None = None) -> list[list[float]]:
+        return await self._e.embed_batch(texts, input_type=input_type)
