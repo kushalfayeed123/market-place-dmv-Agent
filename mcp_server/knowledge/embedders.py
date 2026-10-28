@@ -64,6 +64,9 @@ class NvidiaEmbedder:
         self._timeout = timeout
         self._max_retries = max_retries
         self._default_input_type = default_input_type
+        # Reusable HTTP client with connection pooling — avoids a fresh TCP+TLS
+        # handshake on every embed_batch call (each of which may fire many requests).
+        self._client: httpx.AsyncClient | None = None
 
     @property
     def dim(self) -> int:
@@ -72,6 +75,26 @@ class NvidiaEmbedder:
     @property
     def model_name(self) -> str:
         return self._model
+
+    def _get_client(self) -> httpx.AsyncClient:
+        import httpx  # local import keeps httpx optional for TF-IDF-only setups
+        if self._client is None or self._client.is_closed:
+            try:
+                import h2  # noqa: F401
+                _http2 = True
+            except ImportError:
+                _http2 = False
+            self._client = httpx.AsyncClient(
+                timeout=httpx.Timeout(self._timeout),
+                follow_redirects=True,
+                http2=_http2,
+            )
+        return self._client
+
+    async def close(self) -> None:
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
 
     async def embed(self, text: str, input_type: str | None = None) -> list[float]:
         return (await self.embed_batch([text], input_type=input_type))[0]
@@ -103,8 +126,8 @@ class NvidiaEmbedder:
         _PERMANENT_CODES = {400, 401, 403, 404, 410}
         for attempt in range(self._max_retries):
             try:
-                async with httpx.AsyncClient(timeout=self._timeout) as client:
-                    resp = await client.post(self.NIM_BASE_URL, json=payload, headers=headers)
+                client = self._get_client()
+                resp = await client.post(self.NIM_BASE_URL, json=payload, headers=headers)
                 if resp.status_code in _PERMANENT_CODES:
                     raise RuntimeError(
                         f"NVIDIA embeddings permanent error: HTTP {resp.status_code}: {resp.text[:200]}"

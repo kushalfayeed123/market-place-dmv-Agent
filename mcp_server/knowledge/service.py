@@ -169,14 +169,18 @@ class KnowledgeService:
         self._store: Any = None
         self._vec_w, self._lex_w, self._fuzzy_w, self._min_score = _scoring_weights(embedder, config)
 
-    def _get_store(self) -> Any:
+    def _get_store(self):
         if self._store is None:
-            from ..vector_store import VectorStore
+            from .vectors import create_vector_store
 
-            self._store = VectorStore(
+            self._store = create_vector_store(
+                provider=getattr(self._config, "vector_store_provider", "redis"),
                 redis_client=self._redis,
                 embedder=_QueryShim(self._embedder),
                 namespace=self._config.index_namespace,
+                chroma_path=getattr(self._config, "chroma_path", None),
+                chroma_host=getattr(self._config, "chroma_host", None),
+                chroma_port=getattr(self._config, "chroma_port", 8000),
             )
         return self._store
 
@@ -248,7 +252,7 @@ class KnowledgeService:
         """Fetch all chunks of one document, merged in order — for full-document citation."""
         try:
             store = self._get_store()
-            doc_ids = await store._redis.smembers(store._meta_key())
+            doc_ids = await store.list_ids()
         except Exception as exc:  # noqa: BLE001
             return KBAnswer(status="kb_unavailable", query=doc_id, message=f"KB unavailable: {exc}")
 
@@ -257,10 +261,12 @@ class KnowledgeService:
             cid = str(cid)
             if f":{doc_id}#chunk" not in cid:
                 continue
-            data = await self._redis.hgetall(f"{self._config.index_namespace}:vector:{cid}")
+            data = await store.get(cid)
             if not data:
                 continue
-            meta = _safe_json(data.get("metadata", "{}"))
+            meta = data.get("metadata", {})
+            if isinstance(meta, str):
+                meta = _safe_json(meta)
             chunks.append((int(meta.get("chunk", 0)), KBResult(
                 id=cid,
                 doc_id=str(meta.get("doc_id", doc_id)),

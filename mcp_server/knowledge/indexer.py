@@ -54,14 +54,18 @@ class KBIndexer:
         self._state = sync_state or SyncState(redis_client, config.index_namespace)
         self._store: Any = None  # lazily created VectorStore on first use
 
-    def _get_store(self) -> Any:
+    def _get_store(self):
         if self._store is None:
-            from ..vector_store import VectorStore
+            from .vectors import create_vector_store
 
-            self._store = VectorStore(
+            self._store = create_vector_store(
+                provider=getattr(self._config, "vector_store_provider", "redis"),
                 redis_client=self._redis,
                 embedder=_EmbedderShim(self._embedder),
                 namespace=self._config.index_namespace,
+                chroma_path=getattr(self._config, "chroma_path", None),
+                chroma_host=getattr(self._config, "chroma_host", None),
+                chroma_port=getattr(self._config, "chroma_port", 8000),
             )
         return self._store
 

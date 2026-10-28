@@ -72,16 +72,26 @@ The agent follows a structured RAG pipeline for knowledge-based queries:
 ## 3. Knowledge Base Integration
 
 ### 3.1 Vector Store Setup
-The knowledge base uses Redis with TF-IDF embedding for semantic search:
+The knowledge base uses Redis as the default vector store for semantic search, with
+TF-IDF embedding as a local fallback embedder. For production deployments that need
+higher-quality embeddings or a dedicated vector DB, Chroma can be selected via
+`KB_VECTOR_STORE=chroma`:
+
+- **Embedded mode (local dev / single-instance):** set `KB_CHROMA_PATH=./chroma_db`
+  to use a `PersistentClient` with on-disk storage.
+- **Server mode (production / multi-instance):** set `KB_CHROMA_HOST=<chroma-host>`
+  and `KB_CHROMA_PORT=<port>` (default 8000) to connect to a standalone Chroma
+  server. In production, the gateway startup validates that the Chroma host is
+  reachable and not localhost.
 
 ```python
-from mcp_server.vector_store import VectorStore, TfidfEmbedder
+from mcp_server.knowledge.config import load_knowledge_config
+from mcp_server.knowledge.embedders import create_embedder
+from mcp_server.knowledge.service import KnowledgeService
 
-vector_store = VectorStore(
-    redis_client=redis_client, 
-    embedder=TfidfEmbedder(), 
-    namespace="agent"
-)
+kb_config = load_knowledge_config()
+embedder = create_embedder(provider=kb_config.embedding_provider, ...)
+vector_store = KnowledgeService(redis_client=redis, embedder=embedder, config=kb_config)
 ```
 
 ### 3.2 Knowledge Tools

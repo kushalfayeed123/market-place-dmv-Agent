@@ -207,6 +207,13 @@ class TestAnonymousAuthGating:
         session = Session(session_id="anon-checkout", role=None)
         events = [ev async for ev in agent.run_turn(session, "checkout please")]
         assert ComponentName.SignInPrompt in _get_components(events)
+        prompt = next(
+            event["directive"]
+            for event in events
+            if event.get("type") == "ui_directive"
+            and event["directive"]["component"] == ComponentName.SignInPrompt
+        )
+        assert prompt["props"]["resume_message"] == "checkout please"
 
     @pytest.mark.asyncio
     async def test_anonymous_refund_prompted_when_model_says_info(self):

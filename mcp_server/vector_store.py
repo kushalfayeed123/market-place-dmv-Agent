@@ -249,3 +249,51 @@ def create_embedder(provider: str = "tfidf", api_key: str | None = None, model: 
     if provider == "tfidf":
         return TfidfEmbedder()
     raise ValueError(f"Unknown embedder provider: {provider!r}")
+
+
+
+# --- Port-compatibility additions for VectorStore (Redis backend) ---
+# These make the Redis backend satisfy the VectorStore Protocol defined
+# in mcp_server.knowledge.vectors (list_ids, delete_many, dim, ready).
+
+VectorStore.dim = property(lambda self: self._embedder.dim)
+
+
+async def _vs_list_ids(self) -> list[str]:
+    """List all indexed document ids."""
+    return await self._redis.smembers(self._meta_key())
+
+
+VectorStore.list_ids = _vs_list_ids
+
+
+async def _vs_delete_many(self, doc_ids: list[str]) -> int:
+    """Delete multiple documents by id. Returns count deleted."""
+    if not doc_ids:
+        return 0
+    pipe = self._redis.pipeline()
+    for doc_id in doc_ids:
+        pipe.delete(self._key(doc_id))
+        pipe.srem(self._meta_key(), doc_id)
+    await pipe.execute()
+    return len(doc_ids)
+
+
+VectorStore.delete_many = _vs_delete_many
+
+
+async def _vs_ready(self) -> bool:
+    """True if the index contains at least one document."""
+    try:
+        return await self._redis.scard(self._meta_key()) > 0
+    except Exception:
+        return False
+
+
+VectorStore.ready = _vs_ready
+
+
+# Backward-compatible alias so the factory can do:
+#   from mcp_server.vector_store import RedisVectorStore
+RedisVectorStore = VectorStore
+

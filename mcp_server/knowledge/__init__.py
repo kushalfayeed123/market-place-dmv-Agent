@@ -8,6 +8,8 @@ Public surface:
 """
 
 from .config import KnowledgeConfig, load_knowledge_config
+from .vectors import VectorStore, create_vector_store
+from .chroma_store import ChromaVectorStore
 from .embedders import (
     Embedder,
     FakeEmbedder,
@@ -24,4 +26,7 @@ __all__ = [
     "NvidiaEmbedder",
     "cosine_similarity",
     "create_embedder",
+    "VectorStore",
+    "create_vector_store",
+    "ChromaVectorStore",
 ]

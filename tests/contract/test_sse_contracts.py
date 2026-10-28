@@ -137,8 +137,7 @@ class TestReplyStyleRules:
 
 
 class TestConfirmationTokenStorage:
-    """Verify that stream_turn stores the confirmed_token in Redis before the
-    agent's turn begins, so the ConfirmationGate can verify it."""
+    """Verify that stream_turn passes the click token into the agent turn."""
 
     @pytest_asyncio.fixture
     async def redis_client(self):
@@ -152,9 +151,8 @@ class TestConfirmationTokenStorage:
         return ConfirmationGate(redis_client, namespace="test", ttl=300)
 
     @pytest.mark.asyncio
-    async def test_stream_turn_stores_confirmed_token(self, redis_client, gate):
-        """stream_turn must store the confirmed_token for mutating_financial tools
-        in Redis before the agent turn runs, so the gate can verify it."""
+    async def test_stream_turn_passes_confirmed_token(self, redis_client, gate):
+        """The agent receives the token and validates it during tool execution."""
 
         class FakeSession:
             session_id = "sess-test"
@@ -186,8 +184,10 @@ class TestConfirmationTokenStorage:
             def __init__(self, gate):
                 self._gate = gate
                 self._model = type("M", (), {"provider_name": "test", "model_name": "test"})()
+                self.confirmed_token = None
 
             async def run_turn(self, session, message, confirmed_token):
+                self.confirmed_token = confirmed_token
                 session.next_turn()
                 yield {"type": "text", "content": "ok"}
 
@@ -207,23 +207,11 @@ class TestConfirmationTokenStorage:
         ):
             events.append(frame)
 
-        # The turn_id for turn 1 (first next_turn call) should have the token stored.
-        # stream_turn computes turn_id = current_turn_id + 1 = 0 + 1 = 1 before run_turn
-        # increments it.
-        turn_id = session.current_turn_id  # run_turn called next_turn, so this is 1
-
-        # Verify the token was stored and can be consumed by check_confirmation.
-        # consume_token is single-use: after this, the token is deleted.
-        valid = await gate.consume_token("sess-test", turn_id, "initiate_checkout", "user-token-abc")
-        assert valid is True, "Token should have been stored by stream_turn and be consumable"
-
-        # Second attempt must fail (single-use).
-        valid2 = await gate.consume_token("sess-test", turn_id, "initiate_checkout", "user-token-abc")
-        assert valid2 is False, "Token must be single-use"
+        assert agent.confirmed_token == "user-token-abc"
 
     @pytest.mark.asyncio
     async def test_stream_turn_no_token_without_confirmed_token(self, redis_client, gate):
-        """When no confirmed_token is provided, nothing should be stored in Redis."""
+        """When no confirmed_token is provided, the gate must receive no token."""
 
         class FakeSession:
             session_id = "sess-no-token"
@@ -276,4 +264,3 @@ class TestConfirmationTokenStorage:
         # No token should have been stored.
         valid = await gate.consume_token("sess-no-token", 1, "initiate_checkout", "any-token")
         assert valid is False, "No token should have been stored when confirmed_token is None"
-

@@ -116,7 +116,7 @@ async def stream_turn(
     save_session: Callable[[], Awaitable[None]],
     turn_timeout: float = 100.0,
     heartbeat: float = 15.0,
-    flush_after: float = 0.05,
+    flush_after: float = 0.01,
     flush_chars: int = 24,
 ) -> AsyncIterator[str]:
     """Yield SSE frames for one turn. Always ends; never cancels the agent mid-step."""
@@ -124,23 +124,10 @@ async def stream_turn(
     started = time.monotonic()
     yield sse("session", {"session_id": session.session_id, "turn_id": turn_id})
 
-    # Store the confirmation token in Redis so the ConfirmationGate can verify it
-    # when a mutating_financial tool is called during this turn. The token was
-    # minted by the frontend on a real DOM click event and is single-use.
-    if confirmed_token and hasattr(agent, "_gate"):
-        from mcp_server.tools_catalog import BY_NAME
-        stored = False
-        for tool_meta in BY_NAME.values():
-            if tool_meta.requires_confirmation:
-                await agent._gate.store_token(
-                    session.session_id, turn_id, tool_meta.name, confirmed_token
-                )
-                stored = True
-        if stored:
-            logger.debug(
-                "stored confirmed_token session=%s turn=%s tools=%d",
-                session.session_id, turn_id, len(BY_NAME),
-            )
+    # The confirmation token is stored lazily in _execute_tool (only for the
+    # specific tool being called), avoiding N Redis round-trips per turn for
+    # tools that are never invoked. The token flows through run_turn →
+    # _handle_event → tool_args → _execute_tool → check_confirmation.
 
     queue: asyncio.Queue = asyncio.Queue()
 

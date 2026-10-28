@@ -20,5 +20,15 @@ services:
         sync: false
       - key: AGENT_MODEL_PROVIDER
         sync: false
+      - key: NVIDIA_CHAT_MODELS   # Lightning 30B is primary for low latency
+        sync: false
       - key: AGENT_CORS_ORIGINS
+        sync: false
+      - key: AGENT_DEBUG           # 0 = production, 1 = debug (requires AGENT_DEBUG_KEY)
+        sync: false
+      - key: KB_VECTOR_STORE             # "redis" (default) or "chroma"
+        sync: false
+      - key: KB_CHROMA_HOST              # required only when KB_VECTOR_STORE=chroma (HTTP server mode)
+        sync: false
+      - key: KB_CHROMA_PORT              # Chroma server port, default 8000 (only when KB_VECTOR_STORE=chroma)
         sync: false

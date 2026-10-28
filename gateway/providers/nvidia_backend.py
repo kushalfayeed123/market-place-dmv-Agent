@@ -8,12 +8,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
 
 from gateway.provider import ModelBackend
+
+logger = logging.getLogger("gateway.nvidia_backend")
 
 # HTTP status codes that are safe to retry (transient errors)
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
@@ -22,6 +25,14 @@ BASE_RETRY_DELAY = 1.0  # seconds
 
 # Status codes that are permanent — retrying wastes tokens and time.
 PERMANENT_STATUS_CODES = {401, 403, 404, 410}
+
+
+def _http2_available() -> bool:
+    try:
+        import h2  # noqa: F401
+        return True
+    except ImportError:
+        return False
 
 
 def _is_rate_limit_error(status_code: int, response_text: str) -> bool:
@@ -70,8 +81,9 @@ async def _retry_with_backoff(
                     and result_status not in PERMANENT_STATUS_CODES
                 ):
                     delay = base_delay * (2**attempt)
-                    print(
-                        f"[NVIDIA] Retryable error detected, retrying in {delay:.1f}s (attempt {attempt + 1}/{max_retries})"
+                    logger.debug(
+                        "Retryable error detected, retrying in %.1fs (attempt %d/%d)",
+                        delay, attempt + 1, max_retries,
                     )
                     await asyncio.sleep(delay)
                     continue
@@ -79,8 +91,9 @@ async def _retry_with_backoff(
         except httpx.TimeoutException:
             if attempt < max_retries:
                 delay = base_delay * (2**attempt)
-                print(
-                    f"[NVIDIA] Request timed out, retrying in {delay:.1f}s (attempt {attempt + 1}/{max_retries})"
+                logger.debug(
+                    "Request timed out, retrying in %.1fs (attempt %d/%d)",
+                    delay, attempt + 1, max_retries,
                 )
                 await asyncio.sleep(delay)
                 continue
@@ -89,8 +102,9 @@ async def _retry_with_backoff(
             last_exception = e
             if attempt < max_retries:
                 delay = base_delay * (2**attempt)
-                print(
-                    f"[NVIDIA] Error: {e}, retrying in {delay:.1f}s (attempt {attempt + 1}/{max_retries})"
+                logger.debug(
+                    "Error: %s, retrying in %.1fs (attempt %d/%d)",
+                    e, delay, attempt + 1, max_retries,
                 )
                 await asyncio.sleep(delay)
                 continue
@@ -114,6 +128,25 @@ class NvidiaBackend(ModelBackend):
         self._api_key = api_key
         self._base_url = (base_url or self.BASE_URL).rstrip("/")
         self._timeout = timeout
+        self._http2 = _http2_available()
+        self._client: httpx.AsyncClient | None = None
+
+    def _get_client(self) -> httpx.AsyncClient:
+        """Return the persistent HTTP client, creating it lazily on first use."""
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(
+                base_url=self._base_url,
+                timeout=httpx.Timeout(self._timeout),
+                follow_redirects=True,
+                http2=self._http2,
+            )
+        return self._client
+
+    async def close(self) -> None:
+        """Close the persistent HTTP client. Call on app shutdown."""
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
 
     @property
     def provider_name(self) -> str:
@@ -147,32 +180,33 @@ class NvidiaBackend(ModelBackend):
             "Accept": "application/json",
         }
 
-        # Log the request payload
-        print(
-            f"[NVIDIA] Classification payload: model={self._model}, message={message[:100]}..."
+        # Log the request payload at debug level (no print in hot path)
+        logger.debug(
+            "Classification payload: model=%s, message=%s...",
+            self._model, message[:100],
         )
 
         async def _do_classify() -> dict[str, Any]:
-            async with httpx.AsyncClient(timeout=self._timeout) as client:
-                resp = await client.post(
-                    f"{self._base_url}/chat/completions",
-                    json=payload,
-                    headers=headers,
-                )
-                if resp.status_code != 200:
-                    error_msg = f"API error {resp.status_code}: {resp.text[:200]}"
-                    print(f"[NVIDIA] Classification API error: {error_msg}")
-                    return {
-                        "intent": "info",
-                        "confidence": 0.0,
-                        "reasoning": "",
-                        "error": error_msg,
-                        "status_code": resp.status_code,
-                    }
-                data = resp.json()
-                content = data["choices"][0]["message"]["content"]
-                print(f"[NVIDIA] Classification response: {content[:200]}")
-                return _parse_classification(content, valid_intents)
+            client = self._get_client()
+            resp = await client.post(
+                f"{self._base_url}/chat/completions",
+                json=payload,
+                headers=headers,
+            )
+            if resp.status_code != 200:
+                error_msg = f"API error {resp.status_code}: {resp.text[:200]}"
+                logger.debug("Classification API error: %s", error_msg)
+                return {
+                    "intent": "info",
+                    "confidence": 0.0,
+                    "reasoning": "",
+                    "error": error_msg,
+                    "status_code": resp.status_code,
+                }
+            data = resp.json()
+            content = data["choices"][0]["message"]["content"]
+            logger.debug("Classification response: %s...", content[:200])
+            return _parse_classification(content, valid_intents)
 
         try:
             result = await _retry_with_backoff(_do_classify)
@@ -187,7 +221,7 @@ class NvidiaBackend(ModelBackend):
             return result
         except Exception as e:
             error_msg = f"Exception: {e!s}"
-            print(f"[NVIDIA] Classification error: {error_msg}")
+            logger.debug("Classification error: %s", error_msg)
             return {
                 "intent": "info",
                 "confidence": 0.0,
@@ -220,31 +254,31 @@ class NvidiaBackend(ModelBackend):
             "Accept": "application/json",
         }
 
-        # Log the request payload
+        # Log the request payload at debug level (no print in hot path)
         user_msg = messages[0].get("content", "")[:100] if messages else ""
-        print(
-            f"[NVIDIA] Stream payload: model={self._model}, tools={len(tools)}, messages={len(messages)}, user_message={user_msg}..."
+        logger.debug(
+            "Stream payload: model=%s, tools=%d, messages=%d, user_message=%s...",
+            self._model, len(tools), len(messages), user_msg,
         )
 
         # Retry loop for rate limiting
         for attempt in range(MAX_RETRIES + 1):
-            print(
-                f"[NVIDIA] Streaming request to {self._model} with {len(tools)} tools (attempt {attempt + 1})"
+            logger.debug(
+                "Streaming request to %s with %d tools (attempt %d)",
+                self._model, len(tools), attempt + 1,
             )
             try:
-                async with (
-                    httpx.AsyncClient(timeout=self._timeout) as client,
-                    client.stream(
-                        "POST",
-                        f"{self._base_url}/chat/completions",
-                        json=payload,
-                        headers=headers,
-                    ) as response,
-                ):
+                client = self._get_client()
+                async with client.stream(
+                    "POST",
+                    f"{self._base_url}/chat/completions",
+                    json=payload,
+                    headers=headers,
+                ) as response:
                     if response.status_code != 200:
                         body = await response.aread()
                         error_msg = f"NVIDIA API error {response.status_code}: {body.decode()[:500]}"
-                        print(f"[NVIDIA] Stream error: {error_msg}")
+                        logger.debug("Stream error: %s", error_msg)
 
                         # Permanent errors — don't retry, yield immediately.
                         if response.status_code in PERMANENT_STATUS_CODES:
@@ -261,7 +295,7 @@ class NvidiaBackend(ModelBackend):
                             and attempt < MAX_RETRIES
                         ):
                             delay = BASE_RETRY_DELAY * (2**attempt)
-                            print(f"[NVIDIA] Rate limited, retrying in {delay:.1f}s...")
+                            logger.debug("Rate limited, retrying in %.1fs...", delay)
                             await asyncio.sleep(delay)
                             continue
 
@@ -280,27 +314,27 @@ class NvidiaBackend(ModelBackend):
                                 (tc.get('function') or {}).get('name') or tc.get('name')
                                 for tc in event.get('tool_calls', [])
                             ]
-                            print(f"[NVIDIA] Stream yielded tool_calls event: {tc_names}")
+                            logger.debug("Stream yielded tool_calls event: %s", tc_names)
                         yield event
-                    print(f"[NVIDIA] Stream completed with {event_count} events")
+                    logger.debug("Stream completed with %d events", event_count)
                     return  # Success, exit retry loop
 
             except httpx.TimeoutException:
                 error_msg = "NVIDIA API request timed out"
-                print(f"[NVIDIA] {error_msg}")
+                logger.debug("%s", error_msg)
                 if attempt < MAX_RETRIES:
                     delay = BASE_RETRY_DELAY * (2**attempt)
-                    print(f"[NVIDIA] Retrying in {delay:.1f}s...")
+                    logger.debug("Retrying in %.1fs...", delay)
                     await asyncio.sleep(delay)
                     continue
                 yield {"type": "error", "error": error_msg, "status_code": 408}
                 return
             except Exception as e:
                 error_msg = f"Unexpected error: {e!s}"
-                print(f"[NVIDIA] {error_msg}")
+                logger.debug("%s", error_msg)
                 if attempt < MAX_RETRIES:
                     delay = BASE_RETRY_DELAY * (2**attempt)
-                    print(f"[NVIDIA] Retrying in {delay:.1f}s...")
+                    logger.debug("Retrying in %.1fs...", delay)
                     await asyncio.sleep(delay)
                     continue
                 yield {"type": "error", "error": error_msg, "status_code": None}

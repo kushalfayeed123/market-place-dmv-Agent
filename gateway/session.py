@@ -31,6 +31,7 @@ class Session:
         self.turn_counter: int = 0
         self._cart: dict = {"items": []}
         self.history: list[dict[str, str]] = []
+        self.pending_confirmation: dict[str, Any] | None = None
 
     @property
     def token(self) -> str | None:
@@ -72,6 +73,7 @@ class Session:
             "turn_counter": self.turn_counter,
             "cart": self._cart,
             "history": self.history,
+            "pending_confirmation": self.pending_confirmation,
         }
 
     @classmethod
@@ -85,6 +87,7 @@ class Session:
         s.turn_counter = data.get("turn_counter", 0)
         s._cart = data.get("cart", {"items": []})
         s.history = list(data.get("history", []))[-HISTORY_LIMIT:]
+        s.pending_confirmation = data.get("pending_confirmation")
         return s
 
 

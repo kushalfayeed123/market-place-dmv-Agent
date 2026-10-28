@@ -136,6 +136,24 @@ class Agent:
         session_id = session.session_id
         self._debug.log_turn_start(session_id, turn_id, user_message)
 
+        if session.pending_confirmation and not confirmed_token:
+            session.pending_confirmation = None
+
+        if confirmed_token and session.pending_confirmation and not session.token:
+            session.pending_confirmation = None
+            yield {
+                "type": "ui_directive",
+                "directive": UIDirective(
+                    component=ComponentName.SignInPrompt,
+                    props={
+                        "message": "Please sign in to place your order.",
+                        "resume_message": "Please continue my checkout.",
+                    },
+                    correlation_id=session_id,
+                ).model_dump(),
+            }
+            return
+
         intent, confidence = await self._decide_intent(user_message, session)
         self._debug.log_intent(session_id, turn_id, intent, confidence)
 
@@ -145,7 +163,10 @@ class Agent:
                 "type": "ui_directive",
                 "directive": UIDirective(
                     component=ComponentName.SignInPrompt,
-                    props={"message": "Please sign in to perform this action."},
+                    props={
+                        "message": "Please sign in to perform this action.",
+                        "resume_message": user_message,
+                    },
                     correlation_id=session_id,
                 ).model_dump(),
             }
@@ -157,15 +178,62 @@ class Agent:
         history = [m for m in (getattr(session, "history", None) or []) if m.get("content")]
         messages: list[dict[str, Any]] = [*history[-8:], {"role": "user", "content": user_message}]
 
-        self._debug.log_model_call(session_id, turn_id, self._model.provider_name, self._model.model_name)
-
         model_parts: list[str] = []
         tool_parts: list[str] = []
         try:
-            max_iterations = 5
+            max_iterations = 3
             iteration = 0
             executed_signatures: set[tuple[str, str]] = set()
             turn_summary_buffer: list[tuple[str, str, dict[str, Any], bool]] = []
+            if confirmed_token and session.pending_confirmation:
+                pending = session.pending_confirmation
+                if not isinstance(pending, dict):
+                    session.pending_confirmation = None
+                    yield {"type": "error", "error": "The pending checkout could not be verified. Please try again."}
+                    return
+                tool_name = pending.get("tool_name")
+                tool_args = pending.get("arguments")
+                from mcp_server.tools_catalog import BY_NAME, is_mutating_financial
+
+                if (
+                    not isinstance(tool_name, str)
+                    or tool_name not in BY_NAME
+                    or tool_name not in {tool.name for tool in tools_for_role(session.role)}
+                    or not is_mutating_financial(tool_name)
+                    or not isinstance(tool_args, dict)
+                ):
+                    session.pending_confirmation = None
+                    yield {"type": "error", "error": "The pending checkout could not be verified. Please try again."}
+                    return
+
+                session.pending_confirmation = None
+                result = await self._execute_tool(
+                    tool_name,
+                    {**tool_args, "user_confirmed_token": confirmed_token},
+                    session,
+                    turn_id,
+                )
+                if result.get("status") == "confirmation_required":
+                    session.pending_confirmation = pending
+                    message = result.get("message", "Please confirm this action.")
+                    self._debug.log_confirmation(session_id, turn_id, tool_name, True, False)
+                    yield {"type": "ui_directive", "directive": _confirmation_directive(tool_name, message, session_id)}
+                    return
+                if result.get("status") == "error":
+                    yield {"type": "error", "error": result.get("message", "Checkout failed. Please try again.")}
+                    return
+
+                text_summary = _result_to_text(tool_name, result)
+                if text_summary:
+                    tool_parts.append(text_summary)
+                    yield {"type": "text", "content": text_summary, "origin": "tool"}
+                directive = self._result_to_directive(tool_name, result, session_id)
+                if directive:
+                    self._debug.log_directive(session_id, turn_id, directive["component"], directive.get("props", {}))
+                    yield {"type": "ui_directive", "directive": directive}
+                return
+
+            self._debug.log_model_call(session_id, turn_id, self._model.provider_name, self._model.model_name)
             while True:
                 iteration += 1
                 if iteration > max_iterations:
@@ -307,6 +375,9 @@ class Agent:
                 tool_list = [single] if single else []
             if isinstance(tool_list, dict):
                 tool_list = [tool_list]
+
+            # Phase 1 — parse & validate all tool calls (no execution yet).
+            pending: list[tuple[str, dict[str, Any], str]] = []
             for tc in tool_list or []:
                 fn = tc.get("function") if isinstance(tc, dict) else None
                 if isinstance(fn, dict):
@@ -339,9 +410,47 @@ class Agent:
                 if is_mutating_financial(tool_name) and confirmed_token:
                     tool_args["user_confirmed_token"] = confirmed_token
 
-                result = await self._execute_tool(tool_name, tool_args, session, turn_id)
+                pending.append((tool_name, tool_args, tool_call_id))
+
+            if not pending:
+                return
+
+            # Phase 2 — execute all tool calls concurrently.
+            # Safe because: read-only tools are independent, mutating tools without
+            # a confirmed_token short-circuit before any backend call, and the
+            # BackendClient has connection pooling + idempotency keys.
+            raw_results = await asyncio.gather(
+                *(self._execute_tool(tn, ta, session, turn_id) for tn, ta, _ in pending),
+                return_exceptions=True,
+            )
+
+            # Phase 3 — emit each result in order.
+            for (tool_name, tool_args, tool_call_id), result in zip(pending, raw_results):
+                if isinstance(result, Exception):
+                    self._debug.log_error(session_id, turn_id, "tool_exec_error", str(result))
+                    yield {"type": "error", "error": f"{tool_name} crashed: {result}"}
+                    tool_results.append({
+                        "tool_call_id": tool_call_id,
+                        "status": "error",
+                        "content": json.dumps({
+                            "status": "error",
+                            "tool_name": tool_name,
+                            "error_kind": "unknown",
+                            "message": str(result),
+                            "instruction": "Tell the user this action is temporarily unavailable. Do not say no products exist.",
+                        }),
+                    })
+                    continue
 
                 if result.get("status") == "confirmation_required":
+                    from mcp_server.tools_catalog import is_mutating_financial
+
+                    if is_mutating_financial(tool_name):
+                        reserved = {"token", "user_confirmed_token", "confirmed_token"}
+                        session.pending_confirmation = {
+                            "tool_name": tool_name,
+                            "arguments": {k: v for k, v in tool_args.items() if k not in reserved},
+                        }
                     self._debug.log_confirmation(session_id, turn_id, tool_name, True, False)
                     yield {
                         "type": "awaiting_confirmation",
@@ -350,15 +459,11 @@ class Agent:
                     }
                     yield {
                         "type": "ui_directive",
-                        "directive": UIDirective(
-                            component=ComponentName.ConfirmationDialog,
-                            props={
-                                "tool_name": tool_name,
-                                "title": "Confirm to proceed",
-                                "message": result.get("message", "Please confirm this action."),
-                            },
-                            correlation_id=session_id,
-                        ).model_dump(),
+                        "directive": _confirmation_directive(
+                            tool_name,
+                            result.get("message", "Please confirm this action."),
+                            session_id,
+                        ),
                     }
                     tool_results.append({
                         "tool_call_id": tool_call_id,
@@ -441,6 +546,14 @@ class Agent:
                 self._debug.log_confirmation(session.session_id, turn_id, tool_name, True, False)
                 return {"status": "confirmation_required", "tool_name": tool_name,
                         "message": f"This action ({tool_name}) requires your confirmation."}
+            # Lazily store the token for *this* tool only (not all confirmation-required
+            # tools), saving N Redis round-trips when only 1 of 20 tools is called.
+            try:
+                await self._gate.store_token(
+                    session.session_id, turn_id, tool_name, provided_token
+                )
+            except Exception as exc:
+                logger.warning("store_token failed for %s: %s", tool_name, exc)
             try:
                 await self._gate.check_confirmation(session.session_id, turn_id, tool_name, provided_token)
             except Exception as e:
@@ -470,6 +583,24 @@ class Agent:
                 # Apply default values from TOOL_PARAMETERS so omitted optional
                 # params (e.g. process_payment.provider) reach the backend.
                 _apply_tool_defaults(tool_name, args)
+                if tool_name == "initiate_checkout":
+                    cart_items = session.get_cart().get("items", [])
+                    if not cart_items:
+                        return {
+                            "status": "error",
+                            "tool_name": tool_name,
+                            "message": "Your cart is empty. Add items before checkout.",
+                            "error_kind": "validation_error",
+                        }
+                    args = {
+                        **args,
+                        "items": [
+                            {"variant_id": item["variant_id"], "quantity": item["quantity"]}
+                            for item in cart_items
+                        ],
+                    }
+                    if "shipping_address" in args and "delivery_address" not in args:
+                        args["delivery_address"] = args.pop("shipping_address")
                 params, path_params, json_body = _build_call_args(meta, args, reserved)
                 body = await self._client.call(
                     meta.method, meta.path, token=token, params=params,
@@ -477,6 +608,8 @@ class Agent:
                     idempotency_key=idempotency_key, correlation_id=session.session_id,
                 )
                 data = _map_tool_result(tool_name, body, args)
+                if tool_name == "initiate_checkout":
+                    session.clear_cart()
         except ToolError as e:
             elapsed = (time.perf_counter() - start) * 1000
             logger.warning("tool %s failed kind=%s status=%s in %.0fms: %s", tool_name, e.error_kind, e.status_code, elapsed, e.message)
@@ -697,6 +830,18 @@ def _args_of(tc: dict[str, Any]) -> dict[str, Any]:
         except json.JSONDecodeError:
             return {}
     return raw if isinstance(raw, dict) else {}
+
+
+def _confirmation_directive(tool_name: str, message: str, session_id: str) -> dict[str, Any]:
+    return UIDirective(
+        component=ComponentName.ConfirmationDialog,
+        props={
+            "tool_name": tool_name,
+            "title": "Confirm to proceed",
+            "message": message,
+        },
+        correlation_id=session_id,
+    ).model_dump()
 
 
 def _grid_props(data: dict[str, Any]) -> dict[str, Any]:

@@ -51,6 +51,11 @@ class KnowledgeConfig:
     # Index identity: namespace suffix carries model+dim so a model change
     # builds a new index instead of corrupting the live one.
     redis_namespace: str = "agent"
+    # Vector store backend: "redis" (default, in-cluster) or "chroma" (self-hosted).
+    vector_store_provider: str = "redis"
+    chroma_path: str | None = None
+    chroma_host: str | None = None
+    chroma_port: int | None = None
     index_version: str = "v1"
 
     # Sync behaviour
@@ -105,6 +110,10 @@ def load_knowledge_config(env: dict[str, str] | None = None) -> KnowledgeConfig:
         embedding_batch_size=_int_env(env, "KB_EMBEDDING_BATCH_SIZE", 64),
         embedding_timeout=_float_env(env, "KB_EMBEDDING_TIMEOUT", 60.0),
         redis_namespace=env.get("AGENT_REDIS_NAMESPACE", "agent"),
+        vector_store_provider=env.get("KB_VECTOR_STORE", "redis").lower(),
+        chroma_path=env.get("KB_CHROMA_PATH"),
+        chroma_host=env.get("KB_CHROMA_HOST"),
+        chroma_port=_int_env(env, "KB_CHROMA_PORT", 8000),
         index_version=env.get("KB_INDEX_VERSION", "v1"),
         sync_interval_seconds=_int_env(env, "KB_SYNC_INTERVAL_SECONDS", 3600),
         backend_base_url=env.get("BACKEND_API_URL", env.get("BACKEND_BASE_URL", "http://localhost:8000")),

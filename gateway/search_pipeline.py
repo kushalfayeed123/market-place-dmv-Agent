@@ -16,6 +16,7 @@ Price filters are always applied locally, converting major units (naira) to mino
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
@@ -266,7 +267,31 @@ async def search_catalog(
             # 'Short' is judged against 20 because some backends cap `limit` below our page size.
             if not page or not fresh or len(page) < min(cfg.page_size, 20):
                 break
-            skip += len(page)
+            stride = len(page)
+            skip += stride
+
+            # Batch-prefetch remaining pages in parallel using stride from page 0.
+            # This overlaps N page fetches that would otherwise be sequential.
+            # seen_ids deduplication guards against any overlap.
+            remaining = max_items - len(out)
+            if remaining > 0:
+                batch = min((remaining + stride - 1) // stride, 3)
+                batch_skips = [skip + i * stride for i in range(batch)]
+                batch_t0 = time.monotonic()
+                batch_pages = await asyncio.gather(
+                    *[fetch_page({**base, **extra, "skip": bs, "limit": cfg.page_size}) for bs in batch_skips]
+                )
+                batch_ms = int((time.monotonic() - batch_t0) * 1000)
+                for i, bp in enumerate(batch_pages):
+                    seen_ids = {str(x.get("id")) for x in out}
+                    fresh = [x for x in bp if str(x.get("id")) not in seen_ids]
+                    out.extend(fresh)
+                    attempts.append({"step": label, "skip": batch_skips[i], "returned": len(bp), "ms": batch_ms // batch})
+                    if not bp or not fresh or len(bp) < min(cfg.page_size, 20):
+                        return out
+                    if len(out) >= max_items:
+                        return out
+                skip += batch * stride
         return out
 
     candidates: list[dict[str, Any]] = []

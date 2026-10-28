@@ -28,8 +28,8 @@ logger = logging.getLogger("gateway.model_router")
 # Default model pool — order matters: first is primary, rest are fallbacks.
 # Updated per probe results: these three returned 200 AND emitted tool_calls.
 _DEFAULT_NVIDIA_CHAT_MODELS = [
-    "nvidia/nemotron-3-ultra-550b-a55b",
     "nvidia/nemotron-3.5-lightning-30b-a3b",
+    "nvidia/nemotron-3-ultra-550b-a55b",
     "meta/muse-glimmer-30b",
 ]
 
@@ -41,8 +41,6 @@ def _parse_chat_models(env_val: str | None) -> list[str]:
 
 
 def get_default_chat_models() -> list[str]:
-    return _parse_chat_models(os.getenv("NVIDIA_CHAT_MODELS"))
-
     return _parse_chat_models(os.getenv("NVIDIA_CHAT_MODELS"))
 
 
@@ -160,6 +158,11 @@ class FailoverBackend(ModelBackend):
                 timeout=self._timeout,
             )
             self._models.append(_ModelEntry(spec=spec, backend=backend))
+
+    async def close(self) -> None:
+        """Close all backend HTTP clients. Call on app shutdown."""
+        for entry in self._models:
+            await entry.backend.close()
 
     @property
     def provider_name(self) -> str:

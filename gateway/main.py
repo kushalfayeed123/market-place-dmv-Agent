@@ -96,6 +96,17 @@ def validate_config(config: dict) -> None:
         problems.append("NVIDIA_API_KEY is not set")
     if config["debug_enabled"] and not config["debug_key"]:
         problems.append("AGENT_DEBUG=1 requires AGENT_DEBUG_KEY")
+    # Chroma in production requires an HTTP host (not embedded/ephemeral mode).
+    kb_provider = os.getenv("KB_VECTOR_STORE", "redis").lower()
+    if kb_provider == "chroma" and _is_production():
+        chroma_host = os.getenv("KB_CHROMA_HOST", "")
+        chroma_port = os.getenv("KB_CHROMA_PORT", "8000")
+        if not chroma_host:
+            problems.append("KB_VECTOR_STORE=chroma in production requires KB_CHROMA_HOST to be set (HTTP server mode)")
+        elif chroma_host in ("localhost", "127.0.0.1", "0.0.0.0"):
+            problems.append("KB_CHROMA_HOST must point at a reachable Chroma server, not localhost")
+        if not chroma_port:
+            problems.append("KB_CHROMA_PORT is empty")
     if problems:
         raise RuntimeError("Invalid production configuration: " + "; ".join(problems))
 
@@ -219,6 +230,26 @@ async def _probe_models(app: FastAPI) -> None:
         logger.warning("model probe error: %s", exc)
 
 
+async def _probe_chroma(app: FastAPI) -> None:
+    """At startup, verify the Chroma server is reachable when KB_VECTOR_STORE=chroma."""
+    kb_provider = os.getenv("KB_VECTOR_STORE", "redis").lower()
+    if kb_provider != "chroma":
+        return
+    chroma_host = os.getenv("KB_CHROMA_HOST", "")
+    chroma_port = os.getenv("KB_CHROMA_PORT", "8000")
+    import httpx
+    url = f"http://{chroma_host}:{chroma_port}/api/v2/heartbeat"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(url)
+        if resp.status_code == 200:
+            logger.info("Chroma server reachable at %s:%s", chroma_host, chroma_port)
+        else:
+            logger.warning("Chroma server returned HTTP %d at %s:%s", resp.status_code, chroma_host, chroma_port)
+    except Exception as exc:
+        logger.warning("Chroma server probe failed (%s:%s): %s. KB sync will retry on use.", chroma_host, chroma_port, exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     config = app.state.config
@@ -239,6 +270,7 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(_connect_redis(app)),
         asyncio.create_task(_self_test(app)),
         asyncio.create_task(_probe_models(app)),
+        asyncio.create_task(_probe_chroma(app)),
     ]
     if config["kb_sync_enabled"]:
         app.state.kb_sync_task = asyncio.create_task(_kb_sync_loop(app))
@@ -250,6 +282,17 @@ async def lifespan(app: FastAPI):
     await asyncio.gather(*tasks, return_exceptions=True)
     if app.state.backend_client is not None:
         await app.state.backend_client.close()
+    if app.state.model_backend is not None:
+        close = getattr(app.state.model_backend, "close", None)
+        if close is not None:
+            await close()
+    if app.state.knowledge_service is not None:
+        embedder = getattr(app.state.knowledge_service, "_embedder", None)
+        if embedder is not None and hasattr(embedder, "close"):
+            try:
+                await embedder.close()
+            except Exception:
+                pass
     closer = getattr(app.state.redis, "aclose", None) or app.state.redis.close
     await closer()
 
