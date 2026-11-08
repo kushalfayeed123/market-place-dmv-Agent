@@ -26,6 +26,11 @@ cents for USD).** A value of `100800` means **₦1,008**, not ₦100,800.
    `unit_price_amount`), pass the `amount` integer unchanged — do not convert it.
 4. The frontend's `formatMoney()` is the single source of truth for rendering;
    it divides by 100 internally.
+5. **Digital products and services are single-unit.** When adding one to the
+   cart, always use `quantity: 1` — a buyer can only own one copy. Never quote a
+   stock count for them: their variants are untracked/unlimited
+   (`quantity_available` is null), so they never run out and never show as
+   sold out.
 
 ## Core Rules
 

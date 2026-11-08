@@ -706,9 +706,22 @@ class Agent:
         policy = raw_variant.get("inventory_policy", "tracked")
         if policy == "tracked" and stock is not None and int(stock) <= 0:
             raise ToolError("This item is out of stock.", error_kind="validation_error")
+        # Digital products and services are single-unit: only one copy can be
+        # bought. Non-tracked variants (untracked/unlimited) have no stock
+        # count at all, so quantity_available is reported as None.
+        product_types = body.get("product_types") if isinstance(body, dict) else None
+        if not isinstance(product_types, list) or not product_types:
+            product_types = [body.get("fulfillment_type")] if isinstance(body, dict) else []
+        single_unit = bool({"digital", "service"} & {str(t) for t in product_types})
+        try:
+            requested_qty = int(args.get("quantity", 1) or 1)
+        except (TypeError, ValueError):
+            requested_qty = 1
+        quantity = 1 if single_unit else max(1, min(requested_qty, 99))
         price = variant.get("price") if isinstance(variant.get("price"), dict) and variant["price"].get("amount") else detail.get("price") or {}
         return {
             **args,
+            "quantity": quantity,
             "variant_id": variant["id"],
             "product_id": product_id,
             "product_name": detail.get("name", ""),
@@ -716,7 +729,8 @@ class Agent:
             "sku": variant.get("sku", ""),
             "unit_price_amount": int(price.get("amount", 0) or 0),
             "unit_price_currency": price.get("currency", "NGN"),
-            "quantity_available": int(stock or 0),
+            "quantity_available": int(stock or 0) if policy == "tracked" else None,
+            "max_quantity": 1 if single_unit else None,
         }
 
     async def _exec_vector_tool(self, tool_name: str, args: dict[str, Any], session: Session) -> dict[str, Any]:
@@ -1081,6 +1095,13 @@ def _exec_session_tool(tool_name: str, args: dict[str, Any], session: Session) -
                 qty = wanted[vid]
                 if qty == 0:
                     continue
+                # Respect the per-line cap (digital/service lines cap at 1).
+                cap = item.get("max_quantity")
+                if cap is not None:
+                    try:
+                        qty = min(qty, max(1, int(cap)))
+                    except (TypeError, ValueError):
+                        pass
                 item["quantity"] = qty
                 unit = item["unit_price"]
                 item["line_total"] = {"amount": qty * int(unit["amount"]), "currency": unit["currency"]}
@@ -1090,22 +1111,37 @@ def _exec_session_tool(tool_name: str, args: dict[str, Any], session: Session) -
         return _build_cart_view(cart).model_dump()
     if tool_name == "add_to_cart":
         variant_id = args.get("variant_id")
+        max_quantity = args.get("max_quantity")
         quantity = max(1, min(int(args.get("quantity", 1) or 1), 99))
+        if max_quantity is not None:
+            try:
+                quantity = min(quantity, max(1, int(max_quantity)))
+            except (TypeError, ValueError):
+                pass
         for item in cart["items"]:
             if item.get("variant_id") == variant_id:
+                cap = item.get("max_quantity") or max_quantity
                 item["quantity"] = min(int(item.get("quantity", 1)) + quantity, 99)
+                if cap is not None:
+                    try:
+                        item["quantity"] = min(item["quantity"], max(1, int(cap)))
+                    except (TypeError, ValueError):
+                        pass
                 item["line_total"]["amount"] = item["quantity"] * item["unit_price"]["amount"]
                 session.set_cart(cart)
                 return _build_cart_view(cart).model_dump()
         unit_amount = int(args.get("unit_price_amount", 0) or 0)
         currency = args.get("unit_price_currency", "NGN")
+        quantity_available = args.get("quantity_available")
         cart["items"].append({
             "variant_id": variant_id, "product_id": args.get("product_id", ""),
             "product_name": args.get("product_name", ""), "variant_name": args.get("variant_name", ""),
             "sku": args.get("sku", ""), "quantity": quantity,
             "unit_price": {"amount": unit_amount, "currency": currency},
             "line_total": {"amount": quantity * unit_amount, "currency": currency},
-            "quantity_available": int(args.get("quantity_available", 0) or 0),
+            # None when stock is not tracked (digital/service/unlimited).
+            "quantity_available": int(quantity_available) if quantity_available is not None else None,
+            "max_quantity": max_quantity,
         })
         session.set_cart(cart)
         return _build_cart_view(cart).model_dump()

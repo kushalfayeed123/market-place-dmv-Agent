@@ -33,6 +33,7 @@ class VariantView(BaseModel):
     name: str
     price: PriceView
     quantity_available: Optional[int] = Field(None, description="None if stock not tracked")
+    inventory_policy: str = Field("tracked", description="'tracked' | 'untracked' | 'unlimited'")
     attributes: dict[str, str] = Field(default_factory=dict, description="e.g. {'color': 'red', 'size': 'L'}")
 
 
@@ -48,6 +49,9 @@ class ProductCardView(BaseModel):
     image_url: Optional[str] = None
     urls: Optional[list[str]] = None  # product image URLs (primary first, then gallery)
     quantity_available: Optional[int] = None
+    inventory_policy: str = "tracked"  # 'tracked' | 'untracked' | 'unlimited'
+    fulfillment_type: Optional[str] = None  # 'physical' | 'digital' | 'service'
+    product_types: list[str] = Field(default_factory=list)
     status: str = "active"
 
 
@@ -86,14 +90,37 @@ def product_llm(p: dict) -> dict:
 
     price_minor = p.get("base_price_amount", 0) or 0
     currency = p.get("base_price_currency", "NGN")
-    qty = p.get("quantity_available")
+    qty, policy = _first_variant_stock(p)
+    if policy is not None and policy != "tracked":
+        in_stock = True  # untracked/unlimited variants never run out
+    else:
+        in_stock = (qty or 0) > 0 if qty is not None else None
     return {
         "id": str(p.get("id", "")),
         "name": p.get("title", p.get("name", "")),
         "price_display": format_money(price_minor, currency),
-        "in_stock": (qty or 0) > 0 if qty is not None else None,
+        "in_stock": in_stock,
         "status": p.get("status", "active"),
     }
+
+
+def _first_variant_stock(p: dict) -> tuple[Optional[int], Optional[str]]:
+    """Return (quantity_available, inventory_policy) from the first variant.
+
+    quantity_available is only meaningful when the policy is 'tracked';
+    untracked/unlimited variants report None so they are never "sold out".
+    """
+    qty = p.get("quantity_available")
+    variants = p.get("variants")
+    if isinstance(variants, list) and variants and isinstance(variants[0], dict):
+        first = variants[0]
+        policy = first.get("inventory_policy") or "tracked"
+        if policy == "tracked":
+            qty = first.get("quantity_available", qty)
+        else:
+            qty = None
+        return qty, policy
+    return qty, None
 
 
 def product_ui(p: dict) -> dict:
@@ -105,11 +132,9 @@ def product_ui(p: dict) -> dict:
     price_minor = p.get("base_price_amount", 0) or 0
     currency = p.get("base_price_currency", "NGN")
     # Derive quantity from first variant if the product is variant-based.
-    qty = p.get("quantity_available")
-    if qty is None and isinstance(p.get("variants"), list) and p["variants"]:
-        first_variant = p["variants"][0]
-        if isinstance(first_variant, dict):
-            qty = first_variant.get("quantity_available")
+    # Only 'tracked' variants have a stock count; others report undefined so
+    # the UI never shows them as sold out.
+    qty, policy = _first_variant_stock(p)
     return {
         "id": str(p.get("id", "")),
         "name": p.get("title", p.get("name", "")),
@@ -124,5 +149,8 @@ def product_ui(p: dict) -> dict:
         "image_url": p.get("image_url", p.get("urls", [None])[0] if isinstance(p.get("urls"), list) else None),
         "urls": p.get("urls"),
         "quantity_available": qty,
+        "inventory_policy": policy or "tracked",
+        "fulfillment_type": p.get("fulfillment_type"),
+        "product_types": p.get("product_types") or ([p.get("fulfillment_type")] if p.get("fulfillment_type") else []),
         "status": p.get("status", "active"),
     }

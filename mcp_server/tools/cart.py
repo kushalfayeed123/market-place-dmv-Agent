@@ -6,10 +6,25 @@ mutate the session cart and return CartView DTOs.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
 
 from mcp_server.utils.price import _map_price
 from schemas.cart import CartLineItemView, CartView, PriceView
+
+
+def _clamp_quantity(quantity: Any, max_quantity: Optional[int]) -> int:
+    """Clamp a requested quantity to [1, 99], honoring a per-line cap."""
+    try:
+        qty = int(quantity or 1)
+    except (TypeError, ValueError):
+        qty = 1
+    qty = max(1, min(qty, 99))
+    if max_quantity is not None:
+        try:
+            qty = min(qty, max(1, int(max_quantity)))
+        except (TypeError, ValueError):
+            pass
+    return qty
 
 
 def register_cart_tools(server: Any, session: Any) -> None:
@@ -28,15 +43,24 @@ def register_cart_tools(server: Any, session: Any) -> None:
         quantity: int = 1,
         unit_price_amount: float = 0,
         unit_price_currency: str = "NGN",
-        quantity_available: int = 0,
+        quantity_available: Optional[int] = None,
+        max_quantity: Optional[int] = None,
     ) -> dict:
-        """Add an item to the session cart."""
+        """Add an item to the session cart.
+
+        ``max_quantity`` caps the line (1 for digital products and services —
+        only one copy makes sense); ``quantity_available`` is None when stock
+        is not tracked.
+        """
         cart = session.get_cart()
+        quantity = _clamp_quantity(quantity, max_quantity)
 
         # Check if already in cart — update quantity
         for item in cart["items"]:
             if item["variant_id"] == variant_id:
-                item["quantity"] += quantity
+                item["quantity"] = _clamp_quantity(
+                    int(item.get("quantity", 1)) + quantity, item.get("max_quantity") or max_quantity
+                )
                 item["line_total"]["amount"] = (
                     item["quantity"] * item["unit_price"]["amount"]
                 )
@@ -62,6 +86,7 @@ def register_cart_tools(server: Any, session: Any) -> None:
                     "currency": unit_price_currency,
                 },
                 "quantity_available": quantity_available,
+                "max_quantity": max_quantity,
             }
         )
         session.set_cart(cart)
@@ -110,7 +135,8 @@ def _build_cart_view(cart: dict) -> CartView:
             quantity=i["quantity"],
             unit_price=_map_price(i["unit_price"].get("amount"), i["unit_price"].get("currency")),
             line_total=_map_price(i["line_total"].get("amount"), i["line_total"].get("currency")),
-            quantity_available=i.get("quantity_available", 0),
+            quantity_available=i.get("quantity_available"),
+            max_quantity=i.get("max_quantity"),
         )
         for i in cart.get("items", [])
     ]
@@ -119,10 +145,11 @@ def _build_cart_view(cart: dict) -> CartView:
     total_amount = sum(i.line_total.amount for i in items)
     currency = items[0].line_total.currency if items else "NGN"
 
-    # Build warnings
+    # Build warnings — only tracked stock can run out; untracked/unlimited
+    # (digital, services) lines report quantity_available=None and never warn.
     warnings: list[str] = []
     for i in items:
-        if i.quantity_available > 0 and i.quantity > i.quantity_available:
+        if i.quantity_available is not None and i.quantity > i.quantity_available:
             warnings.append(
                 f"{i.product_name} ({i.variant_name}): only {i.quantity_available} available"
             )

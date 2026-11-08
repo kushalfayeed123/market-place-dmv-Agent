@@ -27,6 +27,7 @@ def _map_variant(v: dict) -> VariantView:
             v.get("price_override_currency") or v.get("base_price_currency"),
         ),
         quantity_available=v.get("quantity_available"),
+        inventory_policy=v.get("inventory_policy") or "tracked",
         attributes=v.get("attributes", {}) or {},
     )
 
@@ -36,16 +37,23 @@ def _map_product_card(p: dict) -> ProductCardView:
     _attrs = p.get("attributes") or {}
     if not isinstance(_attrs, dict):
         _attrs = {}
-    # Derive quantity_available from the first variant's inventory
+    # Derive quantity_available from the first variant's inventory. Only
+    # 'tracked' variants have a stock count; untracked/unlimited variants
+    # report None so they are never shown as sold out.
     _qty = None
+    _policy = "tracked"
     _variants = p.get("variants") or []
-    if isinstance(_variants, list) and _variants:
-        _qty = _variants[0].get("quantity_available") if isinstance(_variants[0], dict) else None
+    if isinstance(_variants, list) and _variants and isinstance(_variants[0], dict):
+        _policy = _variants[0].get("inventory_policy") or "tracked"
+        if _policy == "tracked":
+            _qty = _variants[0].get("quantity_available")
     # Backend ProductResponse carries images under `urls`; fall back to urls[0]
     # when image_url is absent so cards always render a primary image.
     _urls = p.get("urls")
     _urls = _urls if isinstance(_urls, list) else None
     _image = p.get("image_url") or _attrs.get("image_url") or (_urls[0] if _urls else None)
+    _types = p.get("product_types")
+    _types = _types if isinstance(_types, list) else ([p.get("fulfillment_type")] if p.get("fulfillment_type") else [])
     return ProductCardView(
         id=str(p.get("id", "")),
         name=p.get("title", p.get("name", "")),
@@ -59,6 +67,9 @@ def _map_product_card(p: dict) -> ProductCardView:
         image_url=_image,
         urls=_urls,
         quantity_available=_qty if _qty is not None else p.get("quantity_available"),
+        inventory_policy=_policy,
+        fulfillment_type=p.get("fulfillment_type"),
+        product_types=_types,
         status=p.get("status", "active"),
     )
 
@@ -69,15 +80,22 @@ def _map_product_detail(p: dict) -> ProductDetailView:
     if not isinstance(_attrs, dict):
         _attrs = {}
     variants = [_map_variant(v) for v in (p.get("variants") or [])]
-    # Derive quantity_available from the first variant's inventory
+    # Derive quantity_available from the first variant's inventory. Only
+    # 'tracked' variants have a stock count; others report None so they are
+    # never shown as sold out.
     _qty = None
+    _policy = "tracked"
     if variants:
-        _qty = variants[0].quantity_available
+        _policy = variants[0].inventory_policy
+        if _policy == "tracked":
+            _qty = variants[0].quantity_available
     # Backend ProductResponse carries images under `urls`; fall back to urls[0]
     # when image_url is absent so the detail page always renders a primary image.
     _urls = p.get("urls")
     _urls = _urls if isinstance(_urls, list) else None
     _image = p.get("image_url") or _attrs.get("image_url") or (_urls[0] if _urls else None)
+    _types = p.get("product_types")
+    _types = _types if isinstance(_types, list) else ([p.get("fulfillment_type")] if p.get("fulfillment_type") else [])
     return ProductDetailView(
         id=str(p.get("id", "")),
         name=p.get("title", p.get("name", "")),
@@ -91,6 +109,9 @@ def _map_product_detail(p: dict) -> ProductDetailView:
         image_url=_image,
         urls=_urls,
         quantity_available=_qty if _qty is not None else p.get("quantity_available"),
+        inventory_policy=_policy,
+        fulfillment_type=p.get("fulfillment_type"),
+        product_types=_types,
         status=p.get("status", "active"),
         description=p.get("description"),
         variants=variants,

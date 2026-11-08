@@ -6,6 +6,8 @@ represent the session-cart state that the frontend renders.
 
 from __future__ import annotations
 
+from typing import Optional
+
 from pydantic import BaseModel, Field
 from .catalog import PriceView
 
@@ -20,7 +22,12 @@ class CartLineItemView(BaseModel):
     quantity: int = Field(..., ge=1)
     unit_price: PriceView
     line_total: PriceView
-    quantity_available: int = Field(..., ge=0, description="Available stock at time of add")
+    quantity_available: Optional[int] = Field(
+        None, description="Available stock at time of add; None when stock is not tracked (digital/service/unlimited)"
+    )
+    max_quantity: Optional[int] = Field(
+        None, description="Per-line cap; 1 for digital products and services (one copy only)"
+    )
 
 
 class CartView(BaseModel):
