@@ -510,6 +510,18 @@ def create_app() -> FastAPI:
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
         )
 
+    @app.post("/sessions/{session_id}/cart/clear")
+    async def clear_session_cart(session_id: str):
+        """Clear the session cart — called by the frontend once an order and its
+        payment mode are confirmed, so the cart does not resurrect old lines."""
+        sessions = get_session_store()
+        session = await sessions.get_session(session_id)
+        if session is None:
+            raise HTTPException(404, "Session not found")
+        session.clear_cart()
+        await sessions.save_session(session)
+        return {"status": "ok", "item_count": 0}
+
     # ---------------------------------------------------------------- debug (guarded)
 
     @app.get("/debug/config")

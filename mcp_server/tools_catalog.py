@@ -154,7 +154,17 @@ PROCESS_PAYMENT = ToolMeta(
     risk_tier=RiskTier.HIGH,
     requires_confirmation=True,
     visible_to=frozenset({"buyer", "platform_admin"}),
-    description="Process payment for an order. HIGH risk — financial. Requires user confirmation. Supports 'paystack' (online redirect) or 'pay_on_delivery' (merchant confirms after delivery).",
+    description="Process payment for an order with the provider the buyer chose (see get_payment_methods). HIGH risk — financial. Requires user confirmation. 'paystack' = online redirect; 'pay_on_delivery' = merchant confirms after delivery (physical orders only). Never pick a provider the buyer did not select.",
+)
+
+GET_PAYMENT_METHODS = ToolMeta(
+    name="get_payment_methods",
+    method="GET",
+    path="/payments/methods",
+    risk_tier=RiskTier.READ_ONLY,
+    requires_confirmation=False,
+    visible_to=ROLES | frozenset({"anonymous"}),
+    description="List the payment methods available for an order. Read-only. Pass the order's fulfillment so physical-only methods (Pay on Delivery) are included/excluded correctly. Render the result as a PaymentSelection so the buyer chooses.",
 )
 
 GET_PAYMENT_STATUS = ToolMeta(
@@ -428,6 +438,7 @@ ALL_TOOLS: tuple[ToolMeta, ...] = (
     GET_ORDER_STATUS,
     LIST_ORDERS,
     PROCESS_PAYMENT,
+    GET_PAYMENT_METHODS,
     GET_PAYMENT_STATUS,
     LIST_PAYMENTS,
     REQUEST_REFUND,
@@ -551,11 +562,22 @@ TOOL_PARAMETERS: dict[str, dict[str, Any]] = {
             "order_id": {"type": "string", "description": "The order to pay for."},
             "provider": {
                 "type": "string",
-                "description": "Payment provider: 'paystack' for card/mobile money online (redirects to checkout), or 'pay_on_delivery' to place the order for merchant confirmation after delivery.",
-                "default": "paystack",
+                "description": "The payment provider the buyer selected from get_payment_methods — e.g. 'paystack' for card/mobile money online (redirects to checkout), or 'pay_on_delivery' for merchant-confirmed payment after delivery (physical orders only). Required: never default to a provider the buyer did not choose.",
             },
         },
-        "required": ["order_id"],
+        "required": ["order_id", "provider"],
+    },
+    "get_payment_methods": {
+        "type": "object",
+        "properties": {
+            "fulfillment": {
+                "type": "string",
+                "enum": ["delivery", "pickup", "digital", "service"],
+                "description": "Fulfillment of the order being paid for. 'delivery'/'pickup' = physical goods (enables Pay on Delivery); 'digital'/'service' = no Pay on Delivery.",
+            },
+            "currency": {"type": "string", "description": "ISO 4217 currency to filter providers by supported currency."},
+        },
+        "required": [],
     },
     "get_payment_status": {
         "type": "object",

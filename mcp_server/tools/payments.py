@@ -48,15 +48,15 @@ def register_payments_tools(
 
     @server.tool(
         name="process_payment",
-        description="Process payment for an order. HIGH risk — financial. Requires user confirmation.",
+        description="Process payment for an order with the provider the buyer chose. HIGH risk — financial. Requires user confirmation.",
     )
     async def process_payment(
         order_id: str,
-        provider: str = "paystack",
+        provider: str,
         user_confirmed_token: str | None = None,
         token: str | None = None,
     ) -> dict:
-        """Process payment for an order."""
+        """Process payment for an order. `provider` must be the buyer's chosen method (see get_payment_methods)."""
         session_id = session.session_id
         turn_id = session.current_turn_id
         try:
@@ -74,6 +74,45 @@ def register_payments_tools(
             idempotency_key=idempotency_key,
         )
         return _map_payment(body).model_dump()
+
+    @server.tool(
+        name="get_payment_methods",
+        description="List payment methods available for an order (physical orders also get Pay on Delivery). Read-only.",
+    )
+    async def get_payment_methods(
+        fulfillment: str | None = None,
+        currency: str | None = None,
+        token: str | None = None,
+    ) -> list[dict]:
+        """List available payment methods, optionally filtered by fulfillment/currency."""
+        params: dict[str, Any] = {}
+        if fulfillment:
+            params["fulfillment"] = fulfillment
+        if currency:
+            params["currency"] = currency
+        body = await client.call("GET", "/payments/methods", token=token, params=params or None)
+        items = body.get("items", body) if isinstance(body, dict) else body
+        if not isinstance(items, list):
+            items = [items] if isinstance(items, dict) else []
+        out = []
+        for m in items:
+            if not isinstance(m, dict):
+                continue
+            key = str(m.get("key", ""))
+            name = str(m.get("name", key))
+            implemented = bool(m.get("implemented"))
+            if key == "pay_on_delivery":
+                description = "Pay when your order is delivered — the merchant confirms payment after delivery."
+            else:
+                description = m.get("disabled_reason") or "Pay securely online."
+            out.append({
+                "key": key,
+                "label": name,
+                "description": description,
+                "implemented": implemented,
+                "supported_currencies": m.get("supported_currencies", []),
+            })
+        return out
 
     @server.tool(
         name="get_payment_status",

@@ -80,10 +80,11 @@ cents for USD).** A value of `100800` means **₦1,008**, not ₦100,800.
 1. User wants to checkout → call `view_cart()` to get cart contents
 2. Render `CartSummary` + `ConfirmationDialog` with the total
 3. User clicks "Confirm" → frontend mints `user_confirmed_token`
-4. Present two payment options to the user:
-   - **Pay Now (Paystack)** → call `initiate_checkout(payment_method="paystack", ...)` → redirects to Paystack checkout → after payment completes, poll `get_order_status(order_id)` until `paid` → show `OrderConfirmation`
-   - **Pay on Delivery** → call `initiate_checkout(payment_method="pay_on_delivery", ...)` → order created and placed in `awaiting_approval` → show order reference and tell the user the merchant will reach out to confirm payment after delivery
-5. After payment is complete, show a status widget with the exact order status from `get_order_status`
+4. **Fetch available payment methods** — call `get_payment_methods(fulfillment=<the order's fulfillment: "delivery"/"pickup" for physical carts, "digital"/"service" otherwise>)` and render `PaymentSelection` with the returned methods and the order_id.  Let the buyer pick one.
+5. When the buyer confirms a choice, call `process_payment(order_id=<order_id>, provider=<the buyer's chosen key>)` — requires user confirmation via `ConfirmationDialog`.
+   - **Online provider** (e.g. `paystack`): the backend redirects to the provider's checkout; after payment completes, poll `get_order_status(order_id)` until `paid` → show `OrderConfirmation`.
+   - **Pay on Delivery** (physical orders only): the order is placed in `awaiting_approval` — tell the buyer the merchant will confirm payment after delivery; show the order reference.
+6. After payment is complete, show a status widget with the exact order status from `get_order_status`
 
 ## Component Allowlist
 

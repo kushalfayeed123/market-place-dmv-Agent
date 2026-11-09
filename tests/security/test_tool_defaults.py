@@ -14,24 +14,25 @@ from mcp_server.tools_catalog import TOOL_PARAMETERS
 class TestApplyToolDefaults:
     """Verify that default values are applied correctly."""
 
-    def test_process_payment_provider_default(self):
-        """When provider is omitted, the default 'paystack' must be applied."""
+    def test_process_payment_provider_has_no_default(self):
+        """provider must never be silently defaulted — the buyer's choice from
+        get_payment_methods is required, so no default may be injected."""
         args: dict = {"order_id": "abc-123"}
         _apply_tool_defaults("process_payment", args)
-        assert args["provider"] == "paystack"
+        assert "provider" not in args
 
     def test_process_payment_provider_not_overridden(self):
         """When provider is explicitly provided, it must NOT be overridden."""
-        args: dict = {"order_id": "abc-123", "provider": "stripe"}
+        args: dict = {"order_id": "abc-123", "provider": "pay_on_delivery"}
         _apply_tool_defaults("process_payment", args)
-        assert args["provider"] == "stripe"
+        assert args["provider"] == "pay_on_delivery"
 
     def test_defaults_do_not_add_missing_undefined_keys(self):
         """Only keys with an explicit default in the schema should be added."""
         args: dict = {"order_id": "abc-123"}
         _apply_tool_defaults("process_payment", args)
         # 'order_id' was already there; no extra unexpected keys added
-        assert set(args.keys()) == {"order_id", "provider"}
+        assert set(args.keys()) == {"order_id"}
 
     @pytest.mark.parametrize("tool_name", sorted(TOOL_PARAMETERS.keys()))
     def test_no_tool_has_undefined_default(self, tool_name):

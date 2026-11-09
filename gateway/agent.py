@@ -515,6 +515,10 @@ class Agent:
                             "data": llm_view(_strip_sensitive(result.get("data", {}))),
                         }),
                     })
+                    # Once the payment mode for an order is confirmed, the cart
+                    # has been converted into an order — clear the session cart.
+                    if tool_name == "process_payment":
+                        session.clear_cart()
 
         elif event_type == "usage":
             self._debug.log_model_usage(session_id, turn_id, event.get("usage", {}))
@@ -815,6 +819,7 @@ class Agent:
             "remove_from_cart": ComponentName.CartSummary,
             "initiate_checkout": ComponentName.PaymentCapturePanel,
             "process_payment": ComponentName.PaymentCapturePanel,
+            "get_payment_methods": ComponentName.PaymentSelection,
             "get_order_status": ComponentName.OrderDetail,
             "list_orders": ComponentName.OrderList,
             "get_merchant_balance": ComponentName.MerchantBalanceCard,
@@ -830,6 +835,20 @@ class Agent:
         if isinstance(raw_props, list):
             if component == ComponentName.OrderList:
                 raw_props = {"orders": raw_props}
+            elif component == ComponentName.PaymentSelection:
+                # Only implemented methods are selectable; unimplemented ones
+                # are omitted so the buyer can only pick what actually works.
+                raw_props = {
+                    "methods": [
+                        {
+                            "key": m.get("key", ""),
+                            "label": m.get("label", m.get("key", "")),
+                            "description": m.get("description", ""),
+                        }
+                        for m in raw_props
+                        if isinstance(m, dict) and m.get("implemented", True)
+                    ]
+                }
             else:
                 raw_props = {"items": raw_props}
         props = _strip_sensitive(raw_props)
