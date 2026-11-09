@@ -146,7 +146,7 @@ class Agent:
                 "directive": UIDirective(
                     component=ComponentName.SignInPrompt,
                     props={
-                        "message": "Please sign in to place your order.",
+                        "message": "You'll need to sign in to place your order.",
                         "resume_message": "Please continue my checkout.",
                     },
                     correlation_id=session_id,
@@ -164,7 +164,7 @@ class Agent:
                 "directive": UIDirective(
                     component=ComponentName.SignInPrompt,
                     props={
-                        "message": "Please sign in to perform this action.",
+                        "message": "You'll need to sign in to do that.",
                         "resume_message": user_message,
                     },
                     correlation_id=session_id,
@@ -189,7 +189,7 @@ class Agent:
                 pending = session.pending_confirmation
                 if not isinstance(pending, dict):
                     session.pending_confirmation = None
-                    yield {"type": "error", "error": "The pending checkout could not be verified. Please try again."}
+                    yield {"type": "error", "error": "I couldn't verify that confirmation — please try again."}
                     return
                 tool_name = pending.get("tool_name")
                 tool_args = pending.get("arguments")
@@ -203,7 +203,7 @@ class Agent:
                     or not isinstance(tool_args, dict)
                 ):
                     session.pending_confirmation = None
-                    yield {"type": "error", "error": "The pending checkout could not be verified. Please try again."}
+                    yield {"type": "error", "error": "I couldn't verify that confirmation — please try again."}
                     return
 
                 session.pending_confirmation = None
@@ -220,7 +220,7 @@ class Agent:
                     yield {"type": "ui_directive", "directive": _confirmation_directive(tool_name, message, session_id)}
                     return
                 if result.get("status") == "error":
-                    yield {"type": "error", "error": result.get("message", "Checkout failed. Please try again.")}
+                    yield {"type": "error", "error": result.get("message", "That checkout didn't go through — please try again.")}
                     return
 
                 text_summary = _result_to_text(tool_name, result)
@@ -234,15 +234,10 @@ class Agent:
                 return
 
             self._debug.log_model_call(session_id, turn_id, self._model.provider_name, self._model.model_name)
+            produced_output = False
             while True:
                 iteration += 1
-                if iteration > max_iterations:
-                    self._debug.log_error(session_id, turn_id, "max_iterations", f"agent loop exceeded {max_iterations} iterations")
-                    yield {"type": "error", "error": "The assistant took too many steps and stopped."}
-                    for summary in _flush_summaries(turn_summary_buffer):
-                        tool_parts.append(summary)
-                        yield {"type": "text", "content": summary, "origin": "tool"}
-                    return
+                over_limit = iteration > max_iterations
 
                 tool_calls_this_stream: list[dict[str, Any]] = []
                 tool_results: list[dict[str, Any]] = []
@@ -256,6 +251,8 @@ class Agent:
                     ):
                         if output.get("type") == "text":
                             (tool_parts if output.get("origin") == "tool" else model_parts).append(output.get("content", ""))
+                        if output.get("type") in ("text", "ui_directive"):
+                            produced_output = True
                         yield output
                     if event.get("type") == "tool_calls":
                         tool_calls_this_stream.extend(event.get("tool_calls", []))
@@ -271,6 +268,17 @@ class Agent:
                     return
 
                 if tool_calls_this_stream and tool_results:
+                    if over_limit:
+                        # The loop budget is spent: stop here, but only report an
+                        # error if the turn produced nothing at all — otherwise the
+                        # shopper already got their results and prose.
+                        self._debug.log_error(session_id, turn_id, "max_iterations", f"agent loop exceeded {max_iterations} iterations")
+                        for summary in _flush_summaries(turn_summary_buffer):
+                            tool_parts.append(summary)
+                            yield {"type": "text", "content": summary, "origin": "tool"}
+                        if not produced_output and not model_parts and not tool_parts:
+                            yield {"type": "error", "error": "I got a little lost there — could you try asking that again?"}
+                        return
                     messages.append({
                         "role": "assistant",
                         "content": None,
@@ -298,7 +306,7 @@ class Agent:
         except Exception as e:
             logger.exception("agent turn failed session=%s turn=%s", session_id, turn_id)
             self._debug.log_error(session_id, turn_id, "agent_error", str(e))
-            yield {"type": "error", "error": f"Agent error: {e!s}"}
+            yield {"type": "error", "error": "Something went wrong on my end. Please try again in a moment."}
         finally:
             remember = getattr(session, "append_exchange", None)
             if callable(remember):
@@ -428,7 +436,7 @@ class Agent:
             for (tool_name, tool_args, tool_call_id), result in zip(pending, raw_results):
                 if isinstance(result, Exception):
                     self._debug.log_error(session_id, turn_id, "tool_exec_error", str(result))
-                    yield {"type": "error", "error": f"{tool_name} crashed: {result}"}
+                    yield {"type": "error", "error": "That action hit a snag — please try again."}
                     tool_results.append({
                         "tool_call_id": tool_call_id,
                         "status": "error",
@@ -933,11 +941,11 @@ def _result_to_text(tool_name: str, result: dict[str, Any]) -> str | None:
             noun = "product" if tool_name == "search_products" or _looks_like_products(items) else "result"
             noun += "" if total == 1 else "s"
             return f"Found {total} {noun}" + (f" for '{query}'." if query else ".")
-        return "Here are the products."
+        return "Here's what I found."
 
     if tool_name == "get_product_detail":
         name = data.get("name", "") if isinstance(data, dict) else ""
-        return f"Here are the details for {name}." if name else "Here are the product details."
+        return f"Here's {name}." if name else "Here are the details."
     if tool_name == "get_categories":
         items = data.get("items", data) if isinstance(data, dict) else data
         if isinstance(items, list):
@@ -945,38 +953,38 @@ def _result_to_text(tool_name: str, result: dict[str, Any]) -> str | None:
         return "Here are the categories."
     if tool_name in ("view_cart",):
         items = data.get("items", []) if isinstance(data, dict) else []
-        return f"Your cart has {len(items)} item{'s' if len(items) != 1 else ''}." if items else "Your cart is empty."
+        return f"You have {len(items)} item{'s' if len(items) != 1 else ''} in your cart." if items else "Your cart is empty."
     if tool_name == "add_to_cart":
-        return "Item added to your cart."
+        return "All set — added to your cart below."
     if tool_name == "update_cart_items":
-        return "Your cart is updated."
+        return "All set — your cart is updated."
     if tool_name == "initiate_checkout":
-        return "Checkout initiated. Here are your order details."
+        return "Your order is ready — here are the details."
     if tool_name == "process_payment":
         status = data.get("status", "") if isinstance(data, dict) else ""
         if status == "initialized":
-            return "Payment initialized. Please complete payment at the provider's page."
+            return "Your payment link is ready below — complete it in the provider's window."
         if status == "success":
-            return "Payment processed successfully."
-        return f"Payment status: {status or 'unknown'}." if status else "Payment processed."
+            return "Payment went through — thank you!"
+        return f"Payment is {status or 'unknown'}." if status else "Payment processed."
     if tool_name == "get_order_status":
         status = data.get("status", "") if isinstance(data, dict) else ""
         order_id = data.get("order_id", "") if isinstance(data, dict) else ""
-        return f"Order {order_id} status: {status}." if status and order_id else "Here is the order status."
+        return f"Order {order_id} is {status}." if status and order_id else "Here's the order status."
     if tool_name == "list_orders":
         if isinstance(data, list):
             return f"Found {len(data)} order{'s' if len(data) != 1 else ''}."
         return "Here are your orders."
     if tool_name == "get_merchant_balance":
         balance = data.get("balance", "") if isinstance(data, dict) else ""
-        return f"Current merchant balance: {balance}." if balance else "Here is the merchant balance."
+        return f"Your current balance is {balance}." if balance else "Here's the merchant balance."
     if tool_name == "get_merchant_ledger":
         if isinstance(data, list):
             return f"Found {len(data)} ledger entr{'ies' if len(data) != 1 else 'y'}."
         return "Here is the merchant ledger."
     if tool_name == "get_fulfillment_status":
         status = data.get("status", "") if isinstance(data, dict) else ""
-        return f"Fulfillment status: {status}." if status else "Here is the fulfillment status."
+        return f"Fulfillment is {status}." if status else "Here's the fulfillment status."
     return None
 
 

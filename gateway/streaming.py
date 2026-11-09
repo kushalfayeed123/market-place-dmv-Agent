@@ -24,7 +24,7 @@ from typing import Any
 logger = logging.getLogger("gateway.stream")
 
 _KEEP_LATEST = {"CartSummary", "OrderList", "MerchantBalanceCard", "LedgerTable", "PaymentCapturePanel"}
-FALLBACK_TEXT = "I couldn't find any results. Try a broader search."
+FALLBACK_TEXT = "I couldn't find any results just yet — want to try a broader search?"
 
 
 def sse(event: str, data: dict[str, Any]) -> str:
@@ -194,6 +194,12 @@ async def stream_turn(
                 if etype == "error":
                     had_error = True
                     logger.warning("turn error session=%s turn=%s: %s", session.session_id, turn_id, event.get("error"))
+                # Flush any prose already generated so it always reaches the
+                # client before the error frame, never after.
+                if text_buf:
+                    yield text_frame(text_buf)
+                    text_buf = ""
+                    last_flush = last_sent = time.monotonic()
                 yield sse(str(etype), {**event, "turn_id": turn_id})
                 last_sent = time.monotonic()
 
@@ -213,11 +219,11 @@ async def stream_turn(
         logger.error("turn timed out after %.0fs session=%s turn=%s", turn_timeout, session.session_id, turn_id)
         if text_buf:
             yield text_frame(text_buf)
-        yield sse("error", {"error": "The agent took too long to respond. Please try again.", "turn_id": turn_id})
+        yield sse("error", {"error": "That's taking longer than usual — please try again in a moment.", "turn_id": turn_id})
     except Exception as exc:
         had_error = True
         logger.exception("stream failed session=%s turn=%s", session.session_id, turn_id)
-        yield sse("error", {"error": f"Something went wrong: {exc}", "turn_id": turn_id})
+        yield sse("error", {"error": "Something went wrong on my end — please try again in a moment.", "turn_id": turn_id})
     finally:
         task.cancel()
         try:
