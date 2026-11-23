@@ -23,7 +23,7 @@ from typing import Any
 
 logger = logging.getLogger("gateway.stream")
 
-_KEEP_LATEST = {"CartSummary", "OrderList", "MerchantBalanceCard", "LedgerTable", "PaymentCapturePanel"}
+_KEEP_LATEST = {"CartSummary", "OrderList", "OrderDetail", "MerchantBalanceCard", "LedgerTable", "PaymentCapturePanel"}
 FALLBACK_TEXT = "I couldn't find any results just yet — want to try a broader search?"
 
 

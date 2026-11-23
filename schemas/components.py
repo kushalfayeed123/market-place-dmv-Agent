@@ -36,6 +36,8 @@ class ComponentName(str, Enum):
     MerchantProfile = "MerchantProfile"
     # Fulfillment
     FulfillmentTracker = "FulfillmentTracker"
+    # Share links
+    ShareLink = "ShareLink"
     # Auth / system
     SignInPrompt = "SignInPrompt"
     ErrorMessage = "ErrorMessage"

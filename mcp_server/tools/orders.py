@@ -40,13 +40,21 @@ def _map_order_summary(o: dict) -> OrderSummaryView:
         total=_map_price(o.get("total_amount"), o.get("currency")),
         item_count=o.get("item_count", len(o.get("items", []))),
         created_at=o.get("created_at", ""),
-        merchant_id=str(o.get("merchant_id", "")),
-        merchant_name=o.get("merchant_name", ""),
+        merchant_id=str(o.get("merchant_id") or ""),
+        # Backend list_orders doesn't always populate merchant_name — never
+        # pass None into a required str field.
+        merchant_name=str(o.get("merchant_name") or ""),
     )
 
 
 def _map_order_detail(o: dict) -> OrderDetailView:
     items = [_map_order_item(i) for i in o.get("items", [])]
+    # The backend OrderResponse has no subtotal field — derive it from the
+    # line items so the buyer never sees a ₦0 subtotal on a real order.
+    subtotal_amount = o.get("subtotal_amount")
+    if subtotal_amount is None:
+        subtotal_amount = sum(i.line_total.amount for i in items)
+    subtotal_currency = o.get("subtotal_currency") or o.get("currency")
     return OrderDetailView(
         id=str(o.get("id", "")),
         order_number=o.get("order_number", str(o.get("id", ""))),
@@ -54,10 +62,10 @@ def _map_order_detail(o: dict) -> OrderDetailView:
         total=_map_price(o.get("total_amount"), o.get("currency")),
         item_count=o.get("item_count", len(items)),
         created_at=o.get("created_at", ""),
-        merchant_id=str(o.get("merchant_id", "")),
-        merchant_name=o.get("merchant_name", ""),
+        merchant_id=str(o.get("merchant_id") or ""),
+        merchant_name=str(o.get("merchant_name") or ""),
         items=items,
-        subtotal=_map_price(o.get("subtotal_amount"), o.get("subtotal_currency")),
+        subtotal=_map_price(subtotal_amount, subtotal_currency),
         payment_status=o.get("payment_status"),
         fulfillment_status=o.get("fulfillment_status"),
         updated_at=o.get("updated_at"),
@@ -156,7 +164,7 @@ def register_orders_tools(
 
     @server.tool(
         name="get_order_status",
-        description="Get the status of an order. Read-only.",
+        description="Get full details of an order (status, items, totals, payment/fulfillment) — the OrderDetail view renders from this. Read-only.",
     )
     async def get_order_status(
         order_id: str,

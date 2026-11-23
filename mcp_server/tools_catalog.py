@@ -143,7 +143,7 @@ GET_ORDER_STATUS = ToolMeta(
     risk_tier=RiskTier.READ_ONLY,
     requires_confirmation=False,
     visible_to=ROLES,
-    description="Get the status of an order. Read-only.",
+    description="Get full details of an order (status, items, totals, payment/fulfillment) — renders the OrderDetail view for the buyer. Read-only.",
 )
 
 # ── Payment tools ───────────────────────────────────────────────────────
@@ -226,7 +226,7 @@ GET_FULFILLMENT_STATUS = ToolMeta(
     risk_tier=RiskTier.READ_ONLY,
     requires_confirmation=False,
     visible_to=ROLES,
-    description="Get fulfillment status for an order. Read-only.",
+    description="Get the fulfillment records (status, carrier, tracking) for an order — renders the FulfillmentTracker. The order reference may be the UUID or the order number (ORD-…). Read-only.",
 )
 
 LIST_FULFILLMENTS = ToolMeta(
@@ -321,6 +321,34 @@ UPDATE_INVENTORY = ToolMeta(
     requires_confirmation=False,
     visible_to=frozenset({"merchant_owner", "merchant_staff", "platform_admin"}),
     description="Update inventory for a variant. Medium risk — mutating, non-financial.",
+)
+
+# ── Share-link tools ──
+CREATE_SHARE_LINK = ToolMeta(
+    name="create_share_link",
+    method="POST",
+    path="/links/",
+    risk_tier=RiskTier.LOW,
+    requires_confirmation=False,
+    visible_to=frozenset({"merchant_owner", "merchant_staff", "platform_admin"}),
+    description=(
+        "Create a shareable link for a store or a chosen set of products. "
+        "Omit product_ids for a store link (visitors see all active products); "
+        "pass product_ids for a product-set link. Returns the public URL."
+    ),
+)
+
+RESOLVE_SHARE_LINK = ToolMeta(
+    name="resolve_share_link",
+    method="GET",
+    path="/links/public/{code}",
+    risk_tier=RiskTier.READ_ONLY,
+    requires_confirmation=False,
+    visible_to=ROLES | frozenset({"anonymous"}),
+    description=(
+        "Resolve a public share-link code (the part after /s/) to the store and "
+        "the products it exposes. Use when a visitor opens a shared link."
+    ),
 )
 
 # ── Store tools ──
@@ -452,6 +480,8 @@ ALL_TOOLS: tuple[ToolMeta, ...] = (
     GET_MERCHANT_PROFILE,
     LIST_MERCHANTS,
     GET_STORE_BY_MERCHANT,
+    CREATE_SHARE_LINK,
+    RESOLVE_SHARE_LINK,
     GET_PAYOUT_ACCOUNTS,
     CREATE_PAYOUT_ACCOUNT,
     GET_PAYOUT_ACCOUNT,
@@ -645,6 +675,26 @@ TOOL_PARAMETERS: dict[str, dict[str, Any]] = {
         "type": "object",
         "properties": {"merchant_id": {"type": "string", "description": "The merchant id."}},
         "required": ["merchant_id"],
+    },
+    "create_share_link": {
+        "type": "object",
+        "properties": {
+            "store_id": {"type": "string", "description": "The store to link to (looked up via get_store_by_merchant if needed)."},
+            "product_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Product ids to embed. Omit (or pass []) for a whole-store link; pass one or more ids for a product-set link.",
+            },
+            "title": {"type": "string", "description": "Optional label for the link, e.g. 'Summer picks'."},
+        },
+        "required": ["store_id"],
+    },
+    "resolve_share_link": {
+        "type": "object",
+        "properties": {
+            "code": {"type": "string", "description": "The share-link code — the part of the URL after /s/."},
+        },
+        "required": ["code"],
     },
     "get_payout_accounts": {
         "type": "object",

@@ -825,6 +825,8 @@ class Agent:
             "get_merchant_balance": ComponentName.MerchantBalanceCard,
             "get_merchant_ledger": ComponentName.LedgerTable,
             "get_fulfillment_status": ComponentName.FulfillmentTracker,
+            "create_share_link": ComponentName.ShareLink,
+            "resolve_share_link": ComponentName.ProductGrid,
         }
         component = component_map.get(tool_name)
         if not component:
@@ -835,6 +837,11 @@ class Agent:
         if isinstance(raw_props, list):
             if component == ComponentName.OrderList:
                 raw_props = {"orders": raw_props}
+            elif component == ComponentName.FulfillmentTracker:
+                # get_fulfillment_status returns the order's fulfillment records;
+                # keep them as `items` so the frontend tracker can derive its
+                # step from the REAL fulfillment statuses.
+                raw_props = {"items": raw_props}
             elif component == ComponentName.PaymentSelection:
                 # Only implemented methods are selectable; unimplemented ones
                 # are omitted so the buyer can only pick what actually works.
@@ -853,8 +860,71 @@ class Agent:
                 raw_props = {"items": raw_props}
         props = _strip_sensitive(raw_props)
         if component == ComponentName.ProductGrid:
-            props = _grid_props(props)
+            # resolve_share_link returns {kind, store, products, ...} — map the
+            # embedded products to grid items so the existing ProductGrid renders
+            # exactly the products in the link (or the whole store for store links).
+            if tool_name == "resolve_share_link" and isinstance(props, dict):
+                products = props.get("products") or []
+                store = props.get("store") or {}
+                items = [_link_product_to_card(p, store) for p in products if isinstance(p, dict)]
+                props = {
+                    "items": items,
+                    "query": props.get("title") or (store.get("name") if isinstance(store, dict) else "") or "",
+                    "count": len(items),
+                    "summary": _link_summary(props, store, len(items)),
+                }
+            else:
+                props = _grid_props(props)
         return UIDirective(component=component, props=props, correlation_id=session_id).model_dump()
+
+
+def _link_product_to_card(p: dict[str, Any], store: dict[str, Any]) -> dict[str, Any]:
+    """Map a resolved share-link product to the ProductCardView shape the grid expects."""
+    from mcp_server.utils.price import _map_price
+
+    variants = p.get("variants") or []
+    first = variants[0] if isinstance(variants, list) and variants and isinstance(variants[0], dict) else {}
+    policy = first.get("inventory_policy") or "tracked"
+    qty = first.get("quantity_available") if policy == "tracked" else None
+    if qty is None and policy == "tracked":
+        # Fall back to the price payload when the variant omits a stock count.
+        qty = first.get("quantity_available")
+    urls = p.get("urls") if isinstance(p.get("urls"), list) else []
+    types = p.get("product_types") if isinstance(p.get("product_types"), list) else []
+    if not types and p.get("fulfillment_type"):
+        types = [p["fulfillment_type"]]
+    price = first.get("price") if isinstance(first.get("price"), dict) else None
+    amount = price.get("amount") if price else p.get("base_price_amount")
+    currency = price.get("currency") if price else p.get("base_price_currency")
+    return {
+        "id": str(p.get("id", "")),
+        "name": p.get("title", p.get("name", "")),
+        "merchant_id": str(p.get("merchant_id", "")),
+        "merchant_name": (store.get("name") if isinstance(store, dict) else "") or p.get("store_name") or "",
+        "price": _map_price(amount, currency).model_dump(),
+        "image_url": urls[0] if urls else None,
+        "urls": urls or None,
+        "quantity_available": qty,
+        "inventory_policy": policy,
+        "fulfillment_type": p.get("fulfillment_type"),
+        "product_types": types,
+        "status": p.get("status", "active"),
+    }
+
+
+def _link_summary(props: dict[str, Any], store: dict[str, Any], count: int) -> str:
+    """One-line summary for a resolved share link, computed from real data."""
+    kind = props.get("kind", "store")
+    store_name = store.get("name", "") if isinstance(store, dict) else ""
+    title = props.get("title") or ""
+    if kind == "products":
+        head = f"{count} product{'s' if count != 1 else ''}"
+        head += f" from {store_name}" if store_name else ""
+        if title:
+            head += f" — {title}"
+        return head
+    head = f"{store_name}" if store_name else "This store"
+    return f"{head} · {count} product{'s' if count != 1 else ''}"
 
 
 # ----------------------------------------------------------------------------------------
@@ -1088,6 +1158,22 @@ def _map_tool_result(tool_name: str, body: Any, args: dict[str, Any]) -> dict[st
         if not isinstance(items, list):
             items = [items] if isinstance(items, dict) else []
         return {"items": [_map_category(c).model_dump() for c in items]}
+    if tool_name == "get_order_status":
+        from mcp_server.tools.orders import _map_order_detail
+
+        # Normalize the flat backend OrderResponse into the OrderDetailView
+        # DTO (total/subtotal PriceViews, items with PriceView prices) so the
+        # frontend OrderDetail component gets the shape it expects.
+        return _map_order_detail(body).model_dump()
+    if tool_name == "list_orders":
+        from mcp_server.tools.orders import _map_order_summary
+
+        items = body.get("items", body) if isinstance(body, dict) else body
+        if not isinstance(items, list):
+            items = [items] if isinstance(items, dict) else []
+        # Return a LIST — _result_to_directive wraps lists as {"orders": [...]}
+        # for the OrderList component.
+        return [_map_order_summary(o).model_dump() for o in items]
     return body
 
 

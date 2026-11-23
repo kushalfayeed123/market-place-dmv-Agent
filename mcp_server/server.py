@@ -56,6 +56,7 @@ from .tools import (
     register_fulfillment_tools,
     register_knowledge_tools,
     register_ledger_tools,
+    register_links_tools,
     register_merchants_tools,
     register_orders_tools,
     register_payments_tools,
@@ -158,6 +159,7 @@ def create_server(
     register_merchants_tools(server, backend_client, bridge)
     register_admin_tools(server, backend_client, gate, bridge)
     register_fulfillment_tools(server, backend_client, bridge)
+    register_links_tools(server, backend_client, bridge)
 
     # Knowledge/RAG tools need Redis; register only when available.
     # The KnowledgeService (with hybrid vector + lexical + fuzzy scoring) is

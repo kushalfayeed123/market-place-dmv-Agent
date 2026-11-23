@@ -56,6 +56,31 @@ class TestCheckoutView:
         assert v.order_id == "o1"
         assert v.payment_required is True
 
+
+class TestOrderSummaryView:
+    def test_merchant_name_defaults_to_empty_when_missing(self):
+        """Regression: the buyer list_orders endpoint does not always populate
+        merchant_name — it used to crash with a pydantic string_type validation
+        error, so the buyer could not load their orders at all."""
+        from mcp_server.tools.orders import _map_order_summary
+        o = _map_order_summary({
+            "id": "o1", "order_number": "ORD-001", "status": "paid",
+            "total_amount": 100800, "currency": "NGN", "item_count": 2,
+            "created_at": "2026-11-10T10:00:00Z", "merchant_id": None,
+            "merchant_name": None,
+        })
+        assert o.merchant_name == ""
+        assert o.merchant_id == ""
+        assert o.total.amount == 100800
+
+    def test_merchant_name_preserved_when_present(self):
+        from mcp_server.tools.orders import _map_order_summary
+        o = _map_order_summary({
+            "id": "o1", "order_number": "ORD-001", "status": "paid",
+            "total_amount": 100, "currency": "NGN", "merchant_name": "Leather Co",
+        })
+        assert o.merchant_name == "Leather Co"
+
 class TestUIDirective:
     def test_minimal(self):
         d = UIDirective(component=ComponentName.ProductGrid, props={"items": []}, correlation_id="x")

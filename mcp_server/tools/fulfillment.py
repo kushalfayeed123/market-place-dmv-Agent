@@ -15,19 +15,23 @@ def register_fulfillment_tools(
 
     @server.tool(
         name="get_fulfillment_status",
-        description="Get fulfillment status for an order. Read-only.",
+        description="Get the fulfillment records (status, carrier, tracking number) for an order — renders the FulfillmentTracker. Read-only.",
     )
     async def get_fulfillment_status(
         order_id: str,
         token: str | None = None,
-    ) -> dict:
-        """Get fulfillment status for an order."""
-        return await client.call(
+    ) -> list[dict]:
+        """Get fulfillment records for an order (accepts UUID or order number)."""
+        body = await client.call(
             "GET",
             "/fulfillment/order/{order_id}",
             token=token,
             path_params={"order_id": order_id},
         )
+        items = body.get("items", body) if isinstance(body, dict) else body
+        if not isinstance(items, list):
+            items = [items] if isinstance(items, dict) else []
+        return items
 
     @server.tool(
         name="list_fulfillments",

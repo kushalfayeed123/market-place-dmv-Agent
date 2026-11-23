@@ -9,6 +9,7 @@ from .ledger import register_ledger_tools
 from .merchants import register_merchants_tools
 from .admin import register_admin_tools
 from .fulfillment import register_fulfillment_tools
+from .links import register_links_tools
 
 __all__ = [
     "register_catalog_tools",
@@ -20,4 +21,5 @@ __all__ = [
     "register_merchants_tools",
     "register_admin_tools",
     "register_fulfillment_tools",
+    "register_links_tools",
 ]

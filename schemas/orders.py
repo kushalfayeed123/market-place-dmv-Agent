@@ -28,7 +28,9 @@ class OrderSummaryView(BaseModel):
     item_count: int
     created_at: str
     merchant_id: str
-    merchant_name: str
+    # The buyer-side list endpoint does not populate merchant_name — default
+    # to "" instead of failing validation on None.
+    merchant_name: str = ""
 
 
 class OrderDetailView(OrderSummaryView):
